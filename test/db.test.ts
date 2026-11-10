@@ -52,7 +52,8 @@ describe('users', () => {
   });
 
   it('refuse a second user with the same email', async () => {
-    await expect(createUser(db, 'ALICE@example.com', 'hash')).rejects.toThrow();
+    // The sign-up route reads this code to answer 409 when two sign-ups race.
+    await expect(createUser(db, 'ALICE@example.com', 'hash')).rejects.toMatchObject({ code: '23505' });
   });
 
   it('return null for unknown users', async () => {

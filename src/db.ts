@@ -103,6 +103,11 @@ export async function createUser(db: Db, email: string, passwordHash: string): P
   return rows[0];
 }
 
+export async function countUsers(db: Db): Promise<number> {
+  const { rows } = await db.query('SELECT count(*)::int AS count FROM users');
+  return rows[0].count;
+}
+
 export async function findUser(db: Db, id: number): Promise<User | null> {
   const { rows } = await db.query('SELECT id, email FROM users WHERE id = $1', [id]);
   return rows[0] ?? null;

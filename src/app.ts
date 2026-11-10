@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import { createMiddleware } from 'hono/factory';
@@ -5,9 +6,13 @@ import { secureHeaders } from 'hono/secure-headers';
 import { ACCESS_TOKEN_LIFETIME_SECONDS, createAccessToken, readAccessToken } from './auth.js';
 import {
   addPhrase,
+  claimUnowned,
+  countUsers,
+  createUser,
   deletePhrase,
   findUser,
   findUserByEmail,
+  isValidEmail,
   listRecent,
   listToday,
   MAX_PHRASE_LENGTH,
@@ -18,7 +23,10 @@ import {
   type DeviceSubscription,
   type User,
 } from './db.js';
-import { dummyHash, MAX_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
+import { checkNewPassword, dummyHash, hashPassword, MAX_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
+
+/** Shorter invite codes would be easy to guess, so they leave sign-up closed. */
+export const MIN_SIGNUP_CODE_LENGTH = 12;
 
 export interface AppConfig {
   db: Db;
@@ -27,6 +35,11 @@ export interface AppConfig {
   vapidPublicKey: string;
   /** Origins of the separate app allowed to call /api, such as https://app.up.railway.app. */
   appOrigins?: string[];
+  /**
+   * The invite code that lets people create an account from the app. Without one
+   * of at least MIN_SIGNUP_CODE_LENGTH characters, sign-up is closed.
+   */
+  signupCode?: string;
 }
 
 type AppEnv = { Variables: { user: User } };
@@ -62,12 +75,42 @@ async function readPhraseText(c: Context): Promise<string | null> {
   return text && text.length <= MAX_PHRASE_LENGTH ? text : null;
 }
 
+function sameSecret(a: string, b: string): boolean {
+  // Hashing gives both sides equal length, which timingSafeEqual requires.
+  const hash = (value: string) => createHash('sha256').update(value).digest();
+  return timingSafeEqual(hash(a), hash(b));
+}
+
+/** Postgres refused a duplicate value, such as an email that two sign-ups claimed at once. */
+function isUniqueViolation(error: unknown): boolean {
+  return (error as { code?: string } | null)?.code === '23505';
+}
+
 const INVALID_TEXT = { error: `Phrase must be 1 to ${MAX_PHRASE_LENGTH} characters` };
 const NOT_FOUND = { error: 'Phrase not found' };
 const WRONG_LOGIN = { error: 'Wrong email or password' };
 
-export function createApp({ db, tokenSecret, vapidPublicKey, appOrigins = [] }: AppConfig): Hono<AppEnv> {
+export function createApp({
+  db,
+  tokenSecret,
+  vapidPublicKey,
+  appOrigins = [],
+  signupCode = '',
+}: AppConfig): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
+  const signupOpen = signupCode.length >= MIN_SIGNUP_CODE_LENGTH;
+
+  /** The body for a new session, the same after logging in and after signing up. */
+  async function sessionFor(user: User) {
+    const { token, expiresAt } = await createAccessToken(tokenSecret, user.id);
+    return {
+      token,
+      expiresAt: expiresAt.toISOString(),
+      // Seconds from now, for clients whose clock may be off.
+      expiresIn: ACCESS_TOKEN_LIFETIME_SECONDS,
+      user: { id: user.id, email: user.email },
+    };
+  }
 
   // The user must still exist: deleting one locks out their tokens at once.
   const requireUser = createMiddleware<AppEnv>(async (c, next) => {
@@ -100,8 +143,8 @@ export function createApp({ db, tokenSecret, vapidPublicKey, appOrigins = [] }: 
     }),
   );
 
-  // The push key is public by design; the app needs it before anyone logs in.
-  app.get('/api/config', (c) => c.json({ vapidPublicKey }));
+  // Public: the app needs both before anyone logs in.
+  app.get('/api/config', (c) => c.json({ vapidPublicKey, signupOpen }));
 
   app.post('/api/login', async (c) => {
     const body = await c.req.json().catch(() => null);
@@ -114,14 +157,36 @@ export function createApp({ db, tokenSecret, vapidPublicKey, appOrigins = [] }: 
     const matches = await verifyPassword(password, user?.passwordHash ?? (await dummyHash()));
     if (!user || !matches) return c.json(WRONG_LOGIN, 401);
 
-    const { token, expiresAt } = await createAccessToken(tokenSecret, user.id);
-    return c.json({
-      token,
-      expiresAt: expiresAt.toISOString(),
-      // Seconds from now, for clients whose clock may be off.
-      expiresIn: ACCESS_TOKEN_LIFETIME_SECONDS,
-      user: { id: user.id, email: user.email },
-    });
+    return c.json(await sessionFor(user));
+  });
+
+  app.post('/api/signup', async (c) => {
+    if (!signupOpen) return c.json({ error: 'Sign-up is closed' }, 403);
+
+    const body = await c.req.json().catch(() => null);
+    const email = typeof body?.email === 'string' ? normalizeEmail(body.email) : '';
+    const password = typeof body?.password === 'string' ? body.password : '';
+    const code = typeof body?.code === 'string' ? body.code.trim() : '';
+    if (!email || !password || !code) return c.json({ error: 'Email, password, and invite code are required' }, 400);
+
+    // The code comes first, so without it nobody learns which emails have an account.
+    if (!sameSecret(code, signupCode)) return c.json({ error: 'Wrong invite code' }, 403);
+    if (!isValidEmail(email)) return c.json({ error: 'Enter a valid email' }, 400);
+    const passwordProblem = checkNewPassword(password);
+    if (passwordProblem) return c.json({ error: `${passwordProblem} for the password` }, 400);
+    if (await findUserByEmail(db, email)) return c.json({ error: 'An account with that email already exists' }, 409);
+
+    let user: User;
+    try {
+      user = await createUser(db, email, await hashPassword(password));
+    } catch (error) {
+      if (isUniqueViolation(error)) return c.json({ error: 'An account with that email already exists' }, 409);
+      throw error;
+    }
+    // The first account gets what was saved before accounts existed.
+    if ((await countUsers(db)) === 1) await claimUnowned(db, user.id);
+
+    return c.json(await sessionFor(user), 201);
   });
 
   app.get('/api/me', requireUser, (c) => c.json(c.get('user')));

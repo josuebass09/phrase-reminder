@@ -1,10 +1,11 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createApp } from '../src/app.js';
+import { createApp, MIN_SIGNUP_CODE_LENGTH } from '../src/app.js';
 import { createAccessToken } from '../src/auth.js';
 import {
   addPhrase,
   listRecent,
   listSubscriptions,
+  listUsers,
   markShown,
   MAX_PHRASE_LENGTH,
   type Db,
@@ -381,7 +382,7 @@ describe('GET /api/config', () => {
     const response = await app.request('/api/config');
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ vapidPublicKey: 'test-public-key' });
+    expect(await response.json()).toEqual({ vapidPublicKey: 'test-public-key', signupOpen: false });
   });
 
   it('forbids the response from loading anything or being framed', async () => {
@@ -428,5 +429,108 @@ describe('CORS', () => {
     const response = await preflight(appWithOrigins(), APP_ORIGIN);
 
     expect(response.headers.get('access-control-allow-origin')).toBeNull();
+  });
+});
+
+describe('POST /api/signup', () => {
+  const CODE = 'invite-code-for-friends';
+  const newAccount = { email: '  Carol@Example.com ', password: 'a long enough password', code: CODE };
+
+  function signupApp(signupCode?: string) {
+    return createApp({ db, tokenSecret: SECRET, vapidPublicKey: 'k', signupCode });
+  }
+
+  function signup(body: unknown, target = signupApp(CODE)) {
+    return target.request('/api/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: typeof body === 'string' ? body : JSON.stringify(body),
+    });
+  }
+
+  const emails = async () => (await listUsers(db)).map((user) => user.email);
+
+  it('creates the account and logs it in for 12 hours', async () => {
+    const response = await signup(newAccount);
+    const body = await response.json();
+
+    expect(response.status).toBe(201);
+    expect(body.user).toEqual({ id: expect.any(Number), email: 'carol@example.com' });
+    expect(body.expiresIn).toBe(12 * 3600);
+    const me = await app.request('/api/me', { headers: { Authorization: `Bearer ${body.token}` } });
+    expect(await me.json()).toEqual(body.user);
+
+    const login = await signupApp(CODE).request('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'carol@example.com', password: newAccount.password }),
+    });
+    expect(login.status).toBe(200);
+  });
+
+  it('says in the config whether sign-up is open', async () => {
+    const config = async (code?: string) => (await signupApp(code).request('/api/config')).json();
+
+    expect((await config(CODE)).signupOpen).toBe(true);
+    expect((await config()).signupOpen).toBe(false);
+    expect((await config('x'.repeat(MIN_SIGNUP_CODE_LENGTH - 1))).signupOpen).toBe(false);
+  });
+
+  it.each([
+    ['no invite code is configured', undefined],
+    ['the configured code is too short to be safe', 'short-code'],
+  ])('is closed when %s', async (_name, configured) => {
+    const response = await signup({ ...newAccount, code: configured ?? CODE }, signupApp(configured));
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: 'Sign-up is closed' });
+    expect(await emails()).not.toContain('carol@example.com');
+  });
+
+  it('rejects a wrong invite code before saying anything about the email', async () => {
+    const wrongCode = await signup({ ...newAccount, code: 'wrong-code-guess' });
+    const takenEmail = await signup({ ...newAccount, email: 'alice@example.com', code: 'wrong-code-guess' });
+
+    expect([wrongCode.status, takenEmail.status]).toEqual([403, 403]);
+    expect(await takenEmail.json()).toEqual({ error: 'Wrong invite code' });
+    expect(await emails()).not.toContain('carol@example.com');
+  });
+
+  it('refuses an email that already has an account', async () => {
+    const response = await signup({ ...newAccount, email: 'ALICE@example.com' });
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: 'An account with that email already exists' });
+  });
+
+  it.each([
+    ['an invalid email', { ...newAccount, email: 'carol' }, 'Enter a valid email'],
+    ['a short password', { ...newAccount, password: 'too short' }, 'Use at least 12 characters for the password'],
+    ['a long password', { ...newAccount, password: 'x'.repeat(201) }, 'Use at most 200 characters for the password'],
+    ['a missing code', { email: newAccount.email, password: newAccount.password }, 'Email, password, and invite code are required'],
+    ['invalid JSON', 'not json', 'Email, password, and invite code are required'],
+  ])('rejects %s', async (_name, body, error) => {
+    const response = await signup(body);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error });
+    expect(await emails()).not.toContain('carol@example.com');
+  });
+
+  it('gives the first account the phrases saved before accounts existed', async () => {
+    await clearTables(db);
+    await insertAged(db, null, 'from before accounts', 30);
+
+    const { user } = await (await signup(newAccount)).json();
+
+    expect(textOf(await listRecent(db, user.id))).toEqual(['from before accounts']);
+  });
+
+  it('gives later accounts nothing of anyone else', async () => {
+    await insertAged(db, null, 'unowned', 30);
+
+    const { user } = await (await signup(newAccount)).json();
+
+    expect(await listRecent(db, user.id)).toEqual([]);
   });
 });
