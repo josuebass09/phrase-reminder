@@ -1,6 +1,6 @@
 # Phrase Reminder
 
-Save English phrases from your phone or computer. Each day at 12:00 Costa Rica time, get a push notification with 3 phrases that are at least 14 days old. Tapping it opens the app, where the Today section shows those phrases in full.
+Save English phrases from your phone or computer. Each day, at the time you pick in the app's settings, get a push notification with phrases that are at least 14 days old (3 by default, at 12:00 Costa Rica time). Tapping it opens the app, where the Today section shows those phrases in full.
 
 This repository is the API and the daily reminder job. The app people use lives in [phrase-reminder-app](https://github.com/josuebass09/phrase-reminder-app). Each user has their own phrases and devices, and logs in with an email and password.
 
@@ -39,7 +39,7 @@ Railway deploys from this repository, so push it to GitHub first. All settings b
 4. Add a **cron service** from the same repository:
    - Build command: `npm run build`
    - Start command: `npm run send-daily`
-   - Cron schedule: `0 18 * * *`
+   - Cron schedule: `*/15 * * * *`
    - Variables: `DATABASE_URL` (reference the Postgres service), `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`
 
 Generate `SESSION_SECRET` with `openssl rand -base64 32`. It signs the access tokens, must be at least 32 characters, and changing it logs out every device.
@@ -48,7 +48,9 @@ Then create the users, as described below. Set `VAPID_SUBJECT` to a contact addr
 
 ### The schedule
 
-Railway cron schedules run in UTC. Costa Rica is UTC-6 all year, so `0 18 * * *` means 12:00 there. If you change the time, also change the `12:00` labels in the app.
+Each user picks their reminder in the app's Settings: on or paused, the time, and 1 to 5 phrases. The time zone comes from their device. New users start at 12:00 Costa Rica time with 3 phrases.
+
+The cron service runs every 15 minutes and sends each user's reminder once per local day, at the first run at or after their time, so it arrives within 15 minutes of it. If runs are missed, the next run within 3 hours still sends it; after that, the day is skipped. A reminder counts as sent once any of the user's devices received it, so a failed run is retried by the next one. Each run that finds nothing due logs `No reminders due`.
 
 ## Users
 
@@ -81,6 +83,8 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `POST /api/signup` with `{ email, password, code }` | No | The same as a login, 201. 403 if the invite is unknown, used, or expired, 409 if the email has an account, 400 for an invalid email or password |
 | `POST /api/invites` | Admin | `{ code, expiresAt }`, 201. 403 for other users |
 | `GET /api/me` | Yes | `{ id, email, isAdmin }` |
+| `GET /api/settings` | Yes | `{ remindersOn, reminderTime, timeZone, phrasesPerDay }` |
+| `PATCH /api/settings` with any of those | Yes | All the settings after the change, or 400 with what's wrong. `reminderTime` is 24-hour `HH:MM`, `timeZone` an IANA zone such as `America/Costa_Rica`, and `phrasesPerDay` 1 to 5 |
 | `GET /api/phrases` | Yes | The user's 50 newest phrases |
 | `GET /api/today` | Yes | The phrases from the user's latest reminder |
 | `POST /api/phrases` with `{ text }` | Yes | The saved phrase, 201 |

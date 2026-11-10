@@ -19,7 +19,7 @@ import {
   listRecent,
   listSubscriptions,
   listToday,
-  listUserIdsWithDevices,
+  listReminderCandidates,
   listUsers,
   markShown,
   pickDailyPhrases,
@@ -108,7 +108,7 @@ describe('users', () => {
     await db.query('DELETE FROM users WHERE id = $1', [alice.id]);
 
     expect((await db.query('SELECT count(*)::int AS n FROM phrases')).rows[0].n).toBe(0);
-    expect(await listUserIdsWithDevices(db)).toEqual([]);
+    expect((await listReminderCandidates(db)).map((candidate) => candidate.userId)).toEqual([]);
   });
 
   it.each([
@@ -357,7 +357,7 @@ describe('push subscriptions', () => {
 
     expect(await listSubscriptions(db, alice.id)).toEqual([]);
     expect(await listSubscriptions(db, bob.id)).toEqual([device]);
-    expect(await listUserIdsWithDevices(db)).toEqual([bob.id]);
+    expect((await listReminderCandidates(db)).map((candidate) => candidate.userId)).toEqual([bob.id]);
   });
 
   it('deletes a subscription by endpoint', async () => {
@@ -409,7 +409,7 @@ describe('ensureSchema', () => {
     expect(await listRecent(old, owner.id)).toEqual([]);
     expect(await claimUnowned(old, owner.id)).toEqual({ phrases: 1, devices: 1 });
     expect(textOf(await listRecent(old, owner.id))).toEqual(['saved before accounts']);
-    expect(await listUserIdsWithDevices(old)).toEqual([owner.id]);
+    expect((await listReminderCandidates(old)).map((candidate) => candidate.userId)).toEqual([owner.id]);
   });
 
   it('makes the oldest user the admin of a database from before admins', async () => {

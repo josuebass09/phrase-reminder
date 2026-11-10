@@ -1,9 +1,10 @@
-import { sendDailyPhrases } from './daily.js';
+import { sendDueReminders } from './daily.js';
 import { connect, ensureSchema } from './db.js';
 import { requireEnv } from './env.js';
 import { createPushSender } from './push.js';
 
-// Railway cron entry point. It must exit when done: if a run stays alive,
+// Railway cron entry point, run every 15 minutes: it sends each user's reminder
+// once it's due (see daily.ts). It must exit when done: if a run stays alive,
 // Railway skips the next one and doesn't stop the old one.
 const send = createPushSender({
   subject: requireEnv('VAPID_SUBJECT'),
@@ -14,10 +15,10 @@ const db = connect(requireEnv('DATABASE_URL'));
 
 try {
   await ensureSchema(db);
-  const { users, phrases, devices, delivered, errors } = await sendDailyPhrases(db, send);
+  const { users, phrases, devices, delivered, errors } = await sendDueReminders(db, send);
 
   if (users === 0) {
-    console.log('Nothing was sent: no user has both reminders turned on and phrases at least 14 days old');
+    console.log('No reminders due');
   } else {
     console.log(`Sent ${phrases} phrases to ${delivered} of ${devices} devices, for ${users} users`);
   }

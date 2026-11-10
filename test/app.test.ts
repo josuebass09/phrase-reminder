@@ -512,6 +512,62 @@ describe('CORS', () => {
   });
 });
 
+describe('/api/settings', () => {
+  const patch = (user: User | null, body: unknown) =>
+    requestAs(user, '/api/settings', { method: 'PATCH', body: typeof body === 'string' ? body : JSON.stringify(body) });
+
+  it('returns the defaults for a new user', async () => {
+    const response = await requestAs(alice, '/api/settings');
+
+    expect(await response.json()).toEqual({
+      remindersOn: true,
+      reminderTime: '12:00',
+      timeZone: 'America/Costa_Rica',
+      phrasesPerDay: 3,
+    });
+  });
+
+  it('changes only the settings sent, for that user only', async () => {
+    const response = await patch(alice, { reminderTime: '08:30', timeZone: 'Europe/Madrid' });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      remindersOn: true,
+      reminderTime: '08:30',
+      timeZone: 'Europe/Madrid',
+      phrasesPerDay: 3,
+    });
+    await patch(alice, { remindersOn: false, phrasesPerDay: 5 });
+    expect(await (await requestAs(alice, '/api/settings')).json()).toMatchObject({
+      remindersOn: false,
+      reminderTime: '08:30',
+      phrasesPerDay: 5,
+    });
+    expect((await (await requestAs(bob, '/api/settings')).json()).reminderTime).toBe('12:00');
+  });
+
+  it.each([
+    ['a time in the wrong format', { reminderTime: '8:30 PM' }, 'reminderTime must be a 24-hour time such as 08:30'],
+    ['an unknown time zone', { timeZone: 'Mars/Olympus_Mons' }, 'timeZone must be a time zone such as America/Costa_Rica'],
+    ['too many phrases', { phrasesPerDay: 6 }, 'phrasesPerDay must be a whole number from 1 to 5'],
+    ['a fraction of a phrase', { phrasesPerDay: 2.5 }, 'phrasesPerDay must be a whole number from 1 to 5'],
+    ['a non-boolean switch', { remindersOn: 'yes' }, 'remindersOn must be true or false'],
+    ['nothing to change', { color: 'blue' }, 'Nothing to change'],
+    ['invalid JSON', 'not json', 'Send the settings to change as a JSON object'],
+  ])('rejects %s and changes nothing', async (_name, body, error) => {
+    const response = await patch(alice, body);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error });
+    expect((await (await requestAs(alice, '/api/settings')).json()).reminderTime).toBe('12:00');
+  });
+
+  it('requires a token', async () => {
+    expect((await requestAs(null, '/api/settings')).status).toBe(401);
+    expect((await patch(null, { phrasesPerDay: 1 })).status).toBe(401);
+  });
+});
+
 describe('POST /api/invites', () => {
   it('gives the admin a single-use code that lasts 7 days, and stores only its hash', async () => {
     const before = Date.now();

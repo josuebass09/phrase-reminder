@@ -17,6 +17,30 @@ export interface UserWithPassword extends User {
   passwordHash: string;
 }
 
+/** A user's reminder settings, chosen in the app. */
+export interface ReminderSettings {
+  remindersOn: boolean;
+  /** Local time of day, as HH:MM in 24-hour time. */
+  reminderTime: string;
+  /** IANA time zone, such as America/Costa_Rica, taken from the user's device. */
+  timeZone: string;
+  phrasesPerDay: number;
+}
+
+export const DEFAULT_SETTINGS: ReminderSettings = {
+  remindersOn: true,
+  reminderTime: '12:00',
+  timeZone: 'America/Costa_Rica',
+  phrasesPerDay: 3,
+};
+
+/** A user who may be due a reminder: reminders on, and at least one device. */
+export interface ReminderCandidate extends ReminderSettings {
+  userId: number;
+  /** The local day of the last reminder sent, as YYYY-MM-DD, or null. */
+  lastReminderDay: string | null;
+}
+
 export interface UserSummary extends User {
   phrases: number;
   devices: number;
@@ -36,6 +60,8 @@ export interface DeviceSubscription {
 
 const PHRASE_COLUMNS = 'id, text, created_at AS "createdAt"';
 const USER_COLUMNS = 'id, email, is_admin AS "isAdmin"';
+const SETTINGS_COLUMNS =
+  'reminders_on AS "remindersOn", reminder_time AS "reminderTime", time_zone AS "timeZone", phrases_per_day AS "phrasesPerDay"';
 
 export function connect(connectionString: string): Db & { end(): Promise<void> } {
   // Timeouts matter for the cron job: a hung run makes Railway skip the next one.
@@ -65,6 +91,13 @@ export async function ensureSchema(db: Db): Promise<void> {
     UPDATE users SET is_admin = true
     WHERE id = (SELECT min(id) FROM users) AND NOT EXISTS (SELECT 1 FROM users WHERE is_admin)
   `);
+  // Reminder settings, chosen in the app. The defaults match the single daily reminder from before.
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reminders_on BOOLEAN NOT NULL DEFAULT ${DEFAULT_SETTINGS.remindersOn}`);
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reminder_time TEXT NOT NULL DEFAULT '${DEFAULT_SETTINGS.reminderTime}'`);
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS time_zone TEXT NOT NULL DEFAULT '${DEFAULT_SETTINGS.timeZone}'`);
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phrases_per_day INTEGER NOT NULL DEFAULT ${DEFAULT_SETTINGS.phrasesPerDay}`);
+  // The user's local day of the last reminder sent, so each day gets one.
+  await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_reminder_day TEXT');
   // Only a hash of each code is kept, so reading the table doesn't give working invites.
   await db.query(`
     CREATE TABLE IF NOT EXISTS invites (
@@ -211,6 +244,48 @@ export async function finishInvite(db: Db, id: number, userId: number | null): P
   );
 }
 
+export async function getSettings(db: Db, userId: number): Promise<ReminderSettings | null> {
+  const { rows } = await db.query(`SELECT ${SETTINGS_COLUMNS} FROM users WHERE id = $1`, [userId]);
+  return rows[0] ?? null;
+}
+
+/** Saves the given settings, leaving the others as they are, and returns them all. */
+export async function updateSettings(
+  db: Db,
+  userId: number,
+  changes: Partial<ReminderSettings>,
+): Promise<ReminderSettings | null> {
+  const columns: Record<keyof ReminderSettings, string> = {
+    remindersOn: 'reminders_on',
+    reminderTime: 'reminder_time',
+    timeZone: 'time_zone',
+    phrasesPerDay: 'phrases_per_day',
+  };
+  const entries = (Object.keys(columns) as (keyof ReminderSettings)[]).filter((key) => changes[key] !== undefined);
+  if (entries.length === 0) return getSettings(db, userId);
+  const assignments = entries.map((key, i) => `${columns[key]} = $${i + 2}`).join(', ');
+  const { rows } = await db.query(
+    `UPDATE users SET ${assignments} WHERE id = $1 RETURNING ${SETTINGS_COLUMNS}`,
+    [userId, ...entries.map((key) => changes[key])],
+  );
+  return rows[0] ?? null;
+}
+
+/** Users with reminders on and at least one device, with what's needed to tell if one is due. */
+export async function listReminderCandidates(db: Db): Promise<ReminderCandidate[]> {
+  const { rows } = await db.query(`
+    SELECT id AS "userId", ${SETTINGS_COLUMNS}, last_reminder_day AS "lastReminderDay"
+    FROM users u
+    WHERE reminders_on AND EXISTS (SELECT 1 FROM push_subscriptions s WHERE s.user_id = u.id)
+    ORDER BY id
+  `);
+  return rows;
+}
+
+export async function setLastReminderDay(db: Db, userId: number, day: string): Promise<void> {
+  await db.query('UPDATE users SET last_reminder_day = $2 WHERE id = $1', [userId, day]);
+}
+
 /** Gives a user the phrases and devices saved before accounts existed. */
 export async function claimUnowned(db: Db, userId: number): Promise<{ phrases: number; devices: number }> {
   const phrases = await db.query('UPDATE phrases SET user_id = $1 WHERE user_id IS NULL RETURNING id', [userId]);
@@ -238,14 +313,6 @@ export async function listSubscriptions(db: Db, userId: number): Promise<DeviceS
     [userId],
   );
   return rows;
-}
-
-/** Users with at least one device that has reminders on. */
-export async function listUserIdsWithDevices(db: Db): Promise<number[]> {
-  const { rows } = await db.query(
-    'SELECT DISTINCT user_id AS "userId" FROM push_subscriptions WHERE user_id IS NOT NULL ORDER BY 1',
-  );
-  return rows.map((row) => row.userId);
 }
 
 export async function deleteSubscription(db: Db, endpoint: string): Promise<void> {

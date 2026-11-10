@@ -13,6 +13,7 @@ import {
   findPhraseTranslation,
   findUserByEmail,
   finishInvite,
+  getSettings,
   isInviteUsable,
   isValidEmail,
   listRecent,
@@ -21,13 +22,16 @@ import {
   normalizeEmail,
   saveSubscription,
   saveTranslation,
+  updateSettings,
   updatePhrase,
   type Db,
   type DeviceSubscription,
+  type ReminderSettings,
   type User,
 } from './db.js';
 import { hashInviteCode, INVITE_LIFETIME_DAYS, newInviteCode } from './invites.js';
 import { checkNewPassword, dummyHash, hashPassword, MAX_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
+import { isValidTime, isValidTimeZone, MAX_PHRASES_PER_DAY } from './schedule.js';
 import type { Translator } from './translate.js';
 
 export interface AppConfig {
@@ -77,6 +81,37 @@ async function readPhraseText(c: Context): Promise<string | null> {
 /** Postgres refused a duplicate value, such as an email that two sign-ups claimed at once. */
 function isUniqueViolation(error: unknown): boolean {
   return (error as { code?: string } | null)?.code === '23505';
+}
+
+/** Reads the settings to change from a JSON body: the changes, or what's wrong with them. */
+function parseSettingsChanges(body: any): { changes: Partial<ReminderSettings> } | { error: string } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { error: 'Send the settings to change as a JSON object' };
+  const changes: Partial<ReminderSettings> = {};
+  if (body.remindersOn !== undefined) {
+    if (typeof body.remindersOn !== 'boolean') return { error: 'remindersOn must be true or false' };
+    changes.remindersOn = body.remindersOn;
+  }
+  if (body.reminderTime !== undefined) {
+    if (typeof body.reminderTime !== 'string' || !isValidTime(body.reminderTime)) {
+      return { error: 'reminderTime must be a 24-hour time such as 08:30' };
+    }
+    changes.reminderTime = body.reminderTime;
+  }
+  if (body.timeZone !== undefined) {
+    if (typeof body.timeZone !== 'string' || !isValidTimeZone(body.timeZone)) {
+      return { error: 'timeZone must be a time zone such as America/Costa_Rica' };
+    }
+    changes.timeZone = body.timeZone;
+  }
+  if (body.phrasesPerDay !== undefined) {
+    const count = body.phrasesPerDay;
+    if (!Number.isInteger(count) || count < 1 || count > MAX_PHRASES_PER_DAY) {
+      return { error: `phrasesPerDay must be a whole number from 1 to ${MAX_PHRASES_PER_DAY}` };
+    }
+    changes.phrasesPerDay = count;
+  }
+  if (Object.keys(changes).length === 0) return { error: 'Nothing to change' };
+  return { changes };
 }
 
 const INVALID_TEXT = { error: `Phrase must be 1 to ${MAX_PHRASE_LENGTH} characters` };
@@ -191,6 +226,15 @@ export function createApp({ db, tokenSecret, vapidPublicKey, appOrigins = [], tr
   });
 
   app.get('/api/me', requireUser, (c) => c.json(c.get('user')));
+
+  app.get('/api/settings', requireUser, async (c) => c.json(await getSettings(db, c.get('user').id)));
+
+  // Changes only the settings sent; the others stay as they are.
+  app.patch('/api/settings', requireUser, async (c) => {
+    const parsed = parseSettingsChanges(await c.req.json().catch(() => null));
+    if ('error' in parsed) return c.json({ error: parsed.error }, 400);
+    return c.json(await updateSettings(db, c.get('user').id, parsed.changes));
+  });
 
   app.get('/api/phrases', requireUser, async (c) => c.json(await listRecent(db, c.get('user').id)));
 
