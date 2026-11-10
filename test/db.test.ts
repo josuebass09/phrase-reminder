@@ -2,14 +2,18 @@ import { PGlite } from '@electric-sql/pglite';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   addPhrase,
+  claimInvite,
   claimUnowned,
+  createInvite,
   createUser,
   deletePhrase,
   deleteSubscription,
   ensureSchema,
   findUser,
   findUserByEmail,
+  finishInvite,
   importPhrases,
+  isInviteUsable,
   isValidEmail,
   listRecent,
   listSubscriptions,
@@ -51,6 +55,11 @@ describe('users', () => {
     expect(await findUser(db, user.id)).toEqual(user);
   });
 
+  it('make only the first user the admin', async () => {
+    expect([alice.isAdmin, bob.isAdmin]).toEqual([true, false]);
+    expect((await createUser(db, 'carol@example.com', 'hash')).isAdmin).toBe(false);
+  });
+
   it('refuse a second user with the same email', async () => {
     // The sign-up route reads this code to answer 409 when two sign-ups race.
     await expect(createUser(db, 'ALICE@example.com', 'hash')).rejects.toMatchObject({ code: '23505' });
@@ -73,8 +82,8 @@ describe('users', () => {
     await saveSubscription(db, bob.id, { endpoint: 'https://push.example/1', p256dh: 'k', auth: 'a' });
 
     expect(await listUsers(db)).toEqual([
-      { id: alice.id, email: alice.email, phrases: 2, devices: 0 },
-      { id: bob.id, email: bob.email, phrases: 0, devices: 1 },
+      { id: alice.id, email: alice.email, isAdmin: true, phrases: 2, devices: 0 },
+      { id: bob.id, email: bob.email, isAdmin: false, phrases: 0, devices: 1 },
     ]);
   });
 
@@ -109,6 +118,45 @@ describe('users', () => {
     [`${'x'.repeat(250)}@example.com`, false],
   ])('accept %j as an email: %s', (email, valid) => {
     expect(isValidEmail(email)).toBe(valid);
+  });
+});
+
+describe('invites', () => {
+  it('can be claimed once, until they expire', async () => {
+    const { expiresAt } = await createInvite(db, alice.id, 'hash-1', 7);
+
+    expect(expiresAt.getTime() - Date.now()).toBeGreaterThan(7 * 24 * 3600_000 - 60_000);
+    expect(await isInviteUsable(db, 'hash-1')).toBe(true);
+    const id = await claimInvite(db, 'hash-1');
+    expect(id).toEqual(expect.any(Number));
+    expect(await isInviteUsable(db, 'hash-1')).toBe(false);
+    expect(await claimInvite(db, 'hash-1')).toBeNull();
+  });
+
+  it('can be freed again when the sign-up fails', async () => {
+    await createInvite(db, alice.id, 'hash-1', 7);
+    const id = (await claimInvite(db, 'hash-1'))!;
+
+    await finishInvite(db, id, null);
+
+    expect(await claimInvite(db, 'hash-1')).toBe(id);
+  });
+
+  it('are unusable once expired or for an unknown hash', async () => {
+    await createInvite(db, alice.id, 'hash-1', 7);
+    await db.query("UPDATE invites SET expires_at = now() - interval '1 second'");
+
+    expect(await isInviteUsable(db, 'hash-1')).toBe(false);
+    expect(await claimInvite(db, 'hash-1')).toBeNull();
+    expect(await claimInvite(db, 'unknown')).toBeNull();
+  });
+
+  it('disappear with the admin who made them', async () => {
+    await createInvite(db, alice.id, 'hash-1', 7);
+
+    await db.query('DELETE FROM users WHERE id = $1', [alice.id]);
+
+    expect(await isInviteUsable(db, 'hash-1')).toBe(false);
   });
 });
 
@@ -342,5 +390,22 @@ describe('ensureSchema', () => {
     expect(await claimUnowned(old, owner.id)).toEqual({ phrases: 1, devices: 1 });
     expect(textOf(await listRecent(old, owner.id))).toEqual(['saved before accounts']);
     expect(await listUserIdsWithDevices(old)).toEqual([owner.id]);
+  });
+
+  it('makes the oldest user the admin of a database from before admins', async () => {
+    const pglite = new PGlite();
+    const old: Db = { query: (sql, params) => pglite.query(sql, params as any[]) };
+    await old.query(`CREATE TABLE users (
+      id SERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+    await old.query("INSERT INTO users (email, password_hash) VALUES ('first@example.com', 'h'), ('second@example.com', 'h')");
+
+    await ensureSchema(old);
+    await ensureSchema(old);
+
+    expect((await listUsers(old)).map((user) => [user.email, user.isAdmin])).toEqual([
+      ['first@example.com', true],
+      ['second@example.com', false],
+    ]);
   });
 });

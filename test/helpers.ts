@@ -10,7 +10,7 @@ export async function createTestDb(): Promise<Db> {
 }
 
 export async function clearTables(db: Db): Promise<void> {
-  await db.query('TRUNCATE users, phrases, push_subscriptions RESTART IDENTITY CASCADE');
+  await db.query('TRUNCATE users, invites, phrases, push_subscriptions RESTART IDENTITY CASCADE');
 }
 
 /** Hashing is slow on purpose, so tests that don't log in skip it. */

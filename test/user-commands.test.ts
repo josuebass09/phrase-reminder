@@ -29,7 +29,8 @@ describe('npm run users -- add', () => {
     const user = await findUserByEmail(db, 'me@example.com');
     expect(user?.email).toBe('me@example.com');
     expect(await verifyPassword(PASSWORD, user!.passwordHash)).toBe(true);
-    expect(lines).toEqual(['Created user me@example.com']);
+    expect(lines).toEqual(['Created user me@example.com, the admin']);
+    expect(user?.isAdmin).toBe(true);
   });
 
   it('gives the new user the phrases saved before accounts existed', async () => {
@@ -86,11 +87,15 @@ describe('npm run users -- set-password', () => {
 describe('npm run users -- list', () => {
   it('lists users with their phrase and device counts', async () => {
     const user = await insertUser(db, 'me@example.com');
+    const friend = await insertUser(db, 'friend@example.com');
     await insertAged(db, user.id, 'one', 1);
 
     await run(['list']);
 
-    expect(lines).toEqual([`${user.id}\tme@example.com\t1 phrases\t0 devices`]);
+    expect(lines).toEqual([
+      `${user.id}\tme@example.com\t1 phrases\t0 devices\tadmin`,
+      `${friend.id}\tfriend@example.com\t0 phrases\t0 devices`,
+    ]);
   });
 
   it('says how to start when there are no users', async () => {

@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createApp, MIN_SIGNUP_CODE_LENGTH } from '../src/app.js';
+import { createApp } from '../src/app.js';
 import { createAccessToken } from '../src/auth.js';
 import {
   addPhrase,
@@ -67,7 +67,7 @@ describe('POST /api/login', () => {
     const body = await response.json();
 
     expect(response.status).toBe(200);
-    expect(body.user).toEqual({ id: alice.id, email: 'alice@example.com' });
+    expect(body.user).toEqual({ id: alice.id, email: 'alice@example.com', isAdmin: true });
     expect(body.expiresIn).toBe(12 * 3600);
     // Token times are whole seconds, so the expiry can fall up to a second before now + 12 hours.
     const expiresAt = new Date(body.expiresAt).getTime();
@@ -75,7 +75,7 @@ describe('POST /api/login', () => {
     expect(expiresAt).toBeLessThanOrEqual(after + 12 * 3600_000);
 
     const me = await app.request('/api/me', { headers: { Authorization: `Bearer ${body.token}` } });
-    expect(await me.json()).toEqual({ id: alice.id, email: 'alice@example.com' });
+    expect(await me.json()).toEqual({ id: alice.id, email: 'alice@example.com', isAdmin: true });
   });
 
   it('ignores case and spaces around the email', async () => {
@@ -152,7 +152,7 @@ describe('GET /api/me', () => {
   it('returns the logged-in user without the password hash', async () => {
     const response = await requestAs(bob, '/api/me');
 
-    expect(await response.json()).toEqual({ id: bob.id, email: 'bob@example.com' });
+    expect(await response.json()).toEqual({ id: bob.id, email: 'bob@example.com', isAdmin: false });
   });
 });
 
@@ -382,7 +382,7 @@ describe('GET /api/config', () => {
     const response = await app.request('/api/config');
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ vapidPublicKey: 'test-public-key', signupOpen: false });
+    expect(await response.json()).toEqual({ vapidPublicKey: 'test-public-key' });
   });
 
   it('forbids the response from loading anything or being framed', async () => {
@@ -432,16 +432,51 @@ describe('CORS', () => {
   });
 });
 
-describe('POST /api/signup', () => {
-  const CODE = 'invite-code-for-friends';
-  const newAccount = { email: '  Carol@Example.com ', password: 'a long enough password', code: CODE };
+describe('POST /api/invites', () => {
+  it('gives the admin a single-use code that lasts 7 days, and stores only its hash', async () => {
+    const before = Date.now();
+    const response = await requestAs(alice, '/api/invites', { method: 'POST' });
+    const { code, expiresAt } = await response.json();
 
-  function signupApp(signupCode?: string) {
-    return createApp({ db, tokenSecret: SECRET, vapidPublicKey: 'k', signupCode });
+    expect(response.status).toBe(201);
+    expect(code).toMatch(/^[\w-]{22}$/);
+    const lifetime = new Date(expiresAt).getTime() - before;
+    expect(Math.round(lifetime / 3600_000)).toBe(7 * 24);
+    const { rows } = await db.query('SELECT code_hash, created_by FROM invites');
+    expect(rows).toEqual([{ code_hash: expect.any(String), created_by: alice.id }]);
+    expect(rows[0].code_hash).not.toBe(code);
+  });
+
+  it('gives a different code each time', async () => {
+    const first = await (await requestAs(alice, '/api/invites', { method: 'POST' })).json();
+    const second = await (await requestAs(alice, '/api/invites', { method: 'POST' })).json();
+
+    expect(first.code).not.toBe(second.code);
+  });
+
+  it('is only for the admin', async () => {
+    const response = await requestAs(bob, '/api/invites', { method: 'POST' });
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: 'Only the admin can invite people' });
+  });
+
+  it('requires a token', async () => {
+    expect((await requestAs(null, '/api/invites', { method: 'POST' })).status).toBe(401);
+  });
+});
+
+describe('POST /api/signup', () => {
+  const PASSWORD_FOR_NEW = 'a long enough password';
+  const UNUSABLE = { error: 'This invite is not valid, was already used, or has expired' };
+
+  async function invite(): Promise<string> {
+    const { code } = await (await requestAs(alice, '/api/invites', { method: 'POST' })).json();
+    return code;
   }
 
-  function signup(body: unknown, target = signupApp(CODE)) {
-    return target.request('/api/signup', {
+  function signup(body: unknown) {
+    return app.request('/api/signup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: typeof body === 'string' ? body : JSON.stringify(body),
@@ -450,87 +485,87 @@ describe('POST /api/signup', () => {
 
   const emails = async () => (await listUsers(db)).map((user) => user.email);
 
-  it('creates the account and logs it in for 12 hours', async () => {
-    const response = await signup(newAccount);
+  it('creates a regular account and logs it in for 12 hours', async () => {
+    const response = await signup({ email: '  Carol@Example.com ', password: PASSWORD_FOR_NEW, code: await invite() });
     const body = await response.json();
 
     expect(response.status).toBe(201);
-    expect(body.user).toEqual({ id: expect.any(Number), email: 'carol@example.com' });
+    expect(body.user).toEqual({ id: expect.any(Number), email: 'carol@example.com', isAdmin: false });
     expect(body.expiresIn).toBe(12 * 3600);
     const me = await app.request('/api/me', { headers: { Authorization: `Bearer ${body.token}` } });
     expect(await me.json()).toEqual(body.user);
-
-    const login = await signupApp(CODE).request('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'carol@example.com', password: newAccount.password }),
-    });
-    expect(login.status).toBe(200);
+    expect((await login({ email: 'carol@example.com', password: PASSWORD_FOR_NEW })).status).toBe(200);
   });
 
-  it('says in the config whether sign-up is open', async () => {
-    const config = async (code?: string) => (await signupApp(code).request('/api/config')).json();
+  it('records who used the invite', async () => {
+    const response = await signup({ email: 'carol@example.com', password: PASSWORD_FOR_NEW, code: await invite() });
+    const { user } = await response.json();
 
-    expect((await config(CODE)).signupOpen).toBe(true);
-    expect((await config()).signupOpen).toBe(false);
-    expect((await config('x'.repeat(MIN_SIGNUP_CODE_LENGTH - 1))).signupOpen).toBe(false);
+    const { rows } = await db.query('SELECT used_by, used_at FROM invites');
+    expect(rows).toEqual([{ used_by: user.id, used_at: expect.any(Date) }]);
   });
 
-  it.each([
-    ['no invite code is configured', undefined],
-    ['the configured code is too short to be safe', 'short-code'],
-  ])('is closed when %s', async (_name, configured) => {
-    const response = await signup({ ...newAccount, code: configured ?? CODE }, signupApp(configured));
+  it('accepts each invite only once', async () => {
+    const code = await invite();
+    await signup({ email: 'carol@example.com', password: PASSWORD_FOR_NEW, code });
+
+    const response = await signup({ email: 'dave@example.com', password: PASSWORD_FOR_NEW, code });
 
     expect(response.status).toBe(403);
-    expect(await response.json()).toEqual({ error: 'Sign-up is closed' });
+    expect(await response.json()).toEqual(UNUSABLE);
+    expect(await emails()).not.toContain('dave@example.com');
+  });
+
+  it('refuses an expired invite', async () => {
+    const code = await invite();
+    await db.query("UPDATE invites SET expires_at = now() - interval '1 second'");
+
+    const response = await signup({ email: 'carol@example.com', password: PASSWORD_FOR_NEW, code });
+
+    expect(response.status).toBe(403);
     expect(await emails()).not.toContain('carol@example.com');
   });
 
-  it('rejects a wrong invite code before saying anything about the email', async () => {
-    const wrongCode = await signup({ ...newAccount, code: 'wrong-code-guess' });
-    const takenEmail = await signup({ ...newAccount, email: 'alice@example.com', code: 'wrong-code-guess' });
+  it('refuses a made-up code before saying anything about the email', async () => {
+    const madeUp = await signup({ email: 'carol@example.com', password: PASSWORD_FOR_NEW, code: 'made-up-code' });
+    const taken = await signup({ email: 'alice@example.com', password: PASSWORD_FOR_NEW, code: 'made-up-code' });
 
-    expect([wrongCode.status, takenEmail.status]).toEqual([403, 403]);
-    expect(await takenEmail.json()).toEqual({ error: 'Wrong invite code' });
+    expect([madeUp.status, taken.status]).toEqual([403, 403]);
+    expect(await taken.json()).toEqual(UNUSABLE);
     expect(await emails()).not.toContain('carol@example.com');
   });
 
-  it('refuses an email that already has an account', async () => {
-    const response = await signup({ ...newAccount, email: 'ALICE@example.com' });
+  it('refuses an email that already has an account, and keeps the invite usable', async () => {
+    const code = await invite();
+
+    const response = await signup({ email: 'ALICE@example.com', password: PASSWORD_FOR_NEW, code });
 
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ error: 'An account with that email already exists' });
+    expect((await signup({ email: 'carol@example.com', password: PASSWORD_FOR_NEW, code })).status).toBe(201);
   });
 
   it.each([
-    ['an invalid email', { ...newAccount, email: 'carol' }, 'Enter a valid email'],
-    ['a short password', { ...newAccount, password: 'too short' }, 'Use at least 12 characters for the password'],
-    ['a long password', { ...newAccount, password: 'x'.repeat(201) }, 'Use at most 200 characters for the password'],
-    ['a missing code', { email: newAccount.email, password: newAccount.password }, 'Email, password, and invite code are required'],
-    ['invalid JSON', 'not json', 'Email, password, and invite code are required'],
-  ])('rejects %s', async (_name, body, error) => {
-    const response = await signup(body);
+    ['an invalid email', { email: 'carol', password: PASSWORD_FOR_NEW }, 'Enter a valid email'],
+    ['a short password', { email: 'carol@example.com', password: 'too short' }, 'Use at least 12 characters for the password'],
+    ['a long password', { email: 'carol@example.com', password: 'x'.repeat(201) }, 'Use at most 200 characters for the password'],
+  ])('rejects %s and keeps the invite usable', async (_name, account, error) => {
+    const code = await invite();
+
+    const response = await signup({ ...account, code });
 
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error });
-    expect(await emails()).not.toContain('carol@example.com');
+    expect((await signup({ email: 'carol@example.com', password: PASSWORD_FOR_NEW, code })).status).toBe(201);
   });
 
-  it('gives the first account the phrases saved before accounts existed', async () => {
-    await clearTables(db);
-    await insertAged(db, null, 'from before accounts', 30);
+  it.each([
+    ['a missing code', { email: 'carol@example.com', password: PASSWORD_FOR_NEW }],
+    ['invalid JSON', 'not json'],
+  ])('rejects %s', async (_name, body) => {
+    const response = await signup(body);
 
-    const { user } = await (await signup(newAccount)).json();
-
-    expect(textOf(await listRecent(db, user.id))).toEqual(['from before accounts']);
-  });
-
-  it('gives later accounts nothing of anyone else', async () => {
-    await insertAged(db, null, 'unowned', 30);
-
-    const { user } = await (await signup(newAccount)).json();
-
-    expect(await listRecent(db, user.id)).toEqual([]);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: 'Email, password, and invite code are required' });
   });
 });

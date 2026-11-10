@@ -9,6 +9,8 @@ export interface Db {
 export interface User {
   id: number;
   email: string;
+  /** Admins can invite people. The first user is the admin. */
+  isAdmin: boolean;
 }
 
 export interface UserWithPassword extends User {
@@ -33,6 +35,7 @@ export interface DeviceSubscription {
 }
 
 const PHRASE_COLUMNS = 'id, text, created_at AS "createdAt"';
+const USER_COLUMNS = 'id, email, is_admin AS "isAdmin"';
 
 export function connect(connectionString: string): Db & { end(): Promise<void> } {
   // Timeouts matter for the cron job: a hung run makes Railway skip the next one.
@@ -54,6 +57,24 @@ export async function ensureSchema(db: Db): Promise<void> {
       email         TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+  await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false');
+  // Admins came after accounts. If there is none, the oldest user becomes one.
+  await db.query(`
+    UPDATE users SET is_admin = true
+    WHERE id = (SELECT min(id) FROM users) AND NOT EXISTS (SELECT 1 FROM users WHERE is_admin)
+  `);
+  // Only a hash of each code is kept, so reading the table doesn't give working invites.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS invites (
+      id         SERIAL PRIMARY KEY,
+      code_hash  TEXT NOT NULL UNIQUE,
+      created_by INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_by    INTEGER REFERENCES users (id) ON DELETE SET NULL,
+      used_at    TIMESTAMPTZ
     )
   `);
   await db.query(`
@@ -95,27 +116,25 @@ export function isValidEmail(email: string): boolean {
   return normalized.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized);
 }
 
+/** The first user becomes the admin. */
 export async function createUser(db: Db, email: string, passwordHash: string): Promise<User> {
   const { rows } = await db.query(
-    'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email',
+    `INSERT INTO users (email, password_hash, is_admin)
+     VALUES ($1, $2, NOT EXISTS (SELECT 1 FROM users))
+     RETURNING ${USER_COLUMNS}`,
     [normalizeEmail(email), passwordHash],
   );
   return rows[0];
 }
 
-export async function countUsers(db: Db): Promise<number> {
-  const { rows } = await db.query('SELECT count(*)::int AS count FROM users');
-  return rows[0].count;
-}
-
 export async function findUser(db: Db, id: number): Promise<User | null> {
-  const { rows } = await db.query('SELECT id, email FROM users WHERE id = $1', [id]);
+  const { rows } = await db.query(`SELECT ${USER_COLUMNS} FROM users WHERE id = $1`, [id]);
   return rows[0] ?? null;
 }
 
 export async function findUserByEmail(db: Db, email: string): Promise<UserWithPassword | null> {
   const { rows } = await db.query(
-    'SELECT id, email, password_hash AS "passwordHash" FROM users WHERE email = $1',
+    `SELECT ${USER_COLUMNS}, password_hash AS "passwordHash" FROM users WHERE email = $1`,
     [normalizeEmail(email)],
   );
   return rows[0] ?? null;
@@ -132,13 +151,62 @@ export async function setPasswordHash(db: Db, id: number, passwordHash: string):
 
 export async function listUsers(db: Db): Promise<UserSummary[]> {
   const { rows } = await db.query(`
-    SELECT u.id, u.email,
+    SELECT u.id, u.email, u.is_admin AS "isAdmin",
       (SELECT count(*)::int FROM phrases p WHERE p.user_id = u.id) AS phrases,
       (SELECT count(*)::int FROM push_subscriptions s WHERE s.user_id = u.id) AS devices
     FROM users u
     ORDER BY u.id
   `);
   return rows;
+}
+
+/** Saves an invite by the hash of its code. It works once, until it expires. */
+export async function createInvite(
+  db: Db,
+  createdBy: number,
+  codeHash: string,
+  lifetimeDays: number,
+): Promise<{ expiresAt: Date }> {
+  const { rows } = await db.query(
+    `INSERT INTO invites (code_hash, created_by, expires_at)
+     VALUES ($1, $2, now() + make_interval(days => $3))
+     RETURNING expires_at AS "expiresAt"`,
+    [codeHash, createdBy, lifetimeDays],
+  );
+  return rows[0];
+}
+
+/** Whether an invite with this code hash exists, is unused, and hasn't expired. */
+export async function isInviteUsable(db: Db, codeHash: string): Promise<boolean> {
+  const { rows } = await db.query(
+    'SELECT 1 FROM invites WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now()',
+    [codeHash],
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Marks a usable invite as used and returns its id, or null if it isn't usable.
+ * Doing both in one statement means two sign-ups can't share one invite.
+ */
+export async function claimInvite(db: Db, codeHash: string): Promise<number | null> {
+  const { rows } = await db.query(
+    `UPDATE invites SET used_at = now()
+     WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now()
+     RETURNING id`,
+    [codeHash],
+  );
+  return rows[0]?.id ?? null;
+}
+
+/** Records who used a claimed invite, or frees it again for null, if the sign-up failed. */
+export async function finishInvite(db: Db, id: number, userId: number | null): Promise<void> {
+  await db.query(
+    userId === null
+      ? 'UPDATE invites SET used_at = NULL, used_by = NULL WHERE id = $1'
+      : 'UPDATE invites SET used_by = $2 WHERE id = $1',
+    userId === null ? [id] : [id, userId],
+  );
 }
 
 /** Gives a user the phrases and devices saved before accounts existed. */

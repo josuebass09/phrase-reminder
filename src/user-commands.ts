@@ -30,7 +30,10 @@ export async function runUsersCommand(db: Db, args: string[], io: CommandIO): Pr
   if (command === 'list' && !email) {
     const users = await listUsers(db);
     if (users.length === 0) io.log('No users yet. Create one with: npm run users -- add <email>');
-    for (const user of users) io.log(`${user.id}\t${user.email}\t${user.phrases} phrases\t${user.devices} devices`);
+    for (const user of users) {
+      const role = user.isAdmin ? '\tadmin' : '';
+      io.log(`${user.id}\t${user.email}\t${user.phrases} phrases\t${user.devices} devices${role}`);
+    }
     return;
   }
 
@@ -39,7 +42,7 @@ export async function runUsersCommand(db: Db, args: string[], io: CommandIO): Pr
     if (await findUserByEmail(db, email)) throw new CommandError(`A user with the email ${email} already exists`);
 
     const user = await createUser(db, email, await hashPassword(await readValidPassword(io)));
-    io.log(`Created user ${user.email}`);
+    io.log(user.isAdmin ? `Created user ${user.email}, the admin` : `Created user ${user.email}`);
 
     // The first user gets what was saved before accounts existed.
     const claimed = await claimUnowned(db, user.id);

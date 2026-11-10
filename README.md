@@ -34,7 +34,7 @@ Railway deploys from this repository, so push it to GitHub first. All settings b
 3. Add a **web service** from this repository:
    - Build command: `npm run build`
    - Start command: `npm start`
-   - Variables: `DATABASE_URL` (reference the Postgres service), `SESSION_SECRET`, `VAPID_PUBLIC_KEY`, `APP_ORIGIN` once the app has a domain, and `SIGNUP_CODE` to let people create accounts from the app
+   - Variables: `DATABASE_URL` (reference the Postgres service), `SESSION_SECRET`, `VAPID_PUBLIC_KEY`, and `APP_ORIGIN` once the app has a domain
    - Generate a public domain under Networking.
 4. Add a **cron service** from the same repository:
    - Build command: `npm run build`
@@ -52,7 +52,9 @@ Railway cron schedules run in UTC. Costa Rica is UTC-6 all year, so `0 18 * * *`
 
 ## Users
 
-People create their own account in the app with an invite code: set `SIGNUP_CODE` on the web service to a code of at least 12 characters, such as from `openssl rand -base64 12`, and share it with them. Anyone who has the code can sign up, so change it to stop that. Without the variable, or with a shorter code, sign-up stays closed and the app doesn't offer it.
+The first user is the admin. In the app, the admin opens the account sheet (the person icon) and taps **Invite someone** to get an invite link. Each link creates one account and expires after 7 days. Opening it shows the app's sign-up form with the code filled in, and the new account is a regular user. The database keeps only a hash of each code, so the link can't be shown again later; create a new one instead.
+
+If the admin account is deleted, the oldest remaining user becomes the admin, and the invites it made stop working.
 
 You can also manage users from a terminal. To do it on Railway, set `DATABASE_URL` in `.env` to the public connection URL of the Railway database first.
 
@@ -64,7 +66,7 @@ npm run users -- list                           # Each user with their phrase an
 
 Passwords need 12 to 200 characters and are stored as scrypt hashes. Emails are case-insensitive.
 
-The first user, created either way, gets the phrases and devices saved before accounts existed, so create your own account before sharing the code. Until then, the API shows them to nobody and the reminder job skips them.
+The first user gets the phrases and devices saved before accounts existed. Until then, the API shows them to nobody and the reminder job skips them.
 
 Logging in gives an access token that lasts 12 hours, then the app asks to log in again. Changing a password doesn't end sessions already open; they last until their token expires. To end every session at once, change `SESSION_SECRET`.
 
@@ -74,10 +76,11 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 
 | Request | Token | Response |
 |---|---|---|
-| `GET /api/config` | No | `{ vapidPublicKey, signupOpen }` |
+| `GET /api/config` | No | `{ vapidPublicKey }` |
 | `POST /api/login` with `{ email, password }` | No | `{ token, expiresAt, expiresIn, user }`, 401 for a wrong email or password, or 400 if one is missing |
-| `POST /api/signup` with `{ email, password, code }` | No | The same as a login, 201. 403 if sign-up is closed or the code is wrong, 409 if the email has an account, 400 for an invalid email or password |
-| `GET /api/me` | Yes | `{ id, email }` |
+| `POST /api/signup` with `{ email, password, code }` | No | The same as a login, 201. 403 if the invite is unknown, used, or expired, 409 if the email has an account, 400 for an invalid email or password |
+| `POST /api/invites` | Admin | `{ code, expiresAt }`, 201. 403 for other users |
+| `GET /api/me` | Yes | `{ id, email, isAdmin }` |
 | `GET /api/phrases` | Yes | The user's 50 newest phrases |
 | `GET /api/today` | Yes | The phrases from the user's latest reminder |
 | `POST /api/phrases` with `{ text }` | Yes | The saved phrase, 201 |
