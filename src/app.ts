@@ -5,10 +5,12 @@ import { getSignedCookie, setSignedCookie } from 'hono/cookie';
 import { secureHeaders } from 'hono/secure-headers';
 import {
   addPhrase,
+  deletePhrase,
   listRecent,
   listToday,
   MAX_PHRASE_LENGTH,
   saveSubscription,
+  updatePhrase,
   type Db,
   type DeviceSubscription,
 } from './db.js';
@@ -39,6 +41,25 @@ function parseSubscription(body: any): DeviceSubscription | null {
     auth.length > 0;
   return isValid ? { endpoint, p256dh, auth } : null;
 }
+
+const MAX_PHRASE_ID = 2_147_483_647; // Postgres SERIAL is a 32-bit integer.
+
+/** Reads a phrase id from the URL. Anything that can't be a stored id is null. */
+function parsePhraseId(value: string): number | null {
+  if (!/^\d{1,10}$/.test(value)) return null;
+  const id = Number(value);
+  return id >= 1 && id <= MAX_PHRASE_ID ? id : null;
+}
+
+/** Reads the trimmed phrase text from a JSON body, or null if it's missing or too long. */
+async function readPhraseText(c: Context): Promise<string | null> {
+  const body = await c.req.json().catch(() => null);
+  const text = typeof body?.text === 'string' ? body.text.trim() : '';
+  return text && text.length <= MAX_PHRASE_LENGTH ? text : null;
+}
+
+const INVALID_TEXT = { error: `Phrase must be 1 to ${MAX_PHRASE_LENGTH} characters` };
+const NOT_FOUND = { error: 'Phrase not found' };
 
 function samePassword(a: string, b: string): boolean {
   // Hashing gives both sides equal length, which timingSafeEqual requires.
@@ -106,13 +127,32 @@ export function createApp({ db, password, sessionSecret, vapidPublicKey }: AppCo
   app.post('/api/phrases', async (c) => {
     if (!(await isLoggedIn(c))) return c.json({ error: 'Not logged in' }, 401);
 
-    const body = await c.req.json().catch(() => null);
-    const text = typeof body?.text === 'string' ? body.text.trim() : '';
-    if (!text || text.length > MAX_PHRASE_LENGTH) {
-      return c.json({ error: `Phrase must be 1 to ${MAX_PHRASE_LENGTH} characters` }, 400);
-    }
+    const text = await readPhraseText(c);
+    if (!text) return c.json(INVALID_TEXT, 400);
 
     return c.json(await addPhrase(db, text), 201);
+  });
+
+  app.patch('/api/phrases/:id', async (c) => {
+    if (!(await isLoggedIn(c))) return c.json({ error: 'Not logged in' }, 401);
+
+    const id = parsePhraseId(c.req.param('id'));
+    if (id === null) return c.json(NOT_FOUND, 404);
+
+    const text = await readPhraseText(c);
+    if (!text) return c.json(INVALID_TEXT, 400);
+
+    const phrase = await updatePhrase(db, id, text);
+    return phrase ? c.json(phrase) : c.json(NOT_FOUND, 404);
+  });
+
+  app.delete('/api/phrases/:id', async (c) => {
+    if (!(await isLoggedIn(c))) return c.json({ error: 'Not logged in' }, 401);
+
+    const id = parsePhraseId(c.req.param('id'));
+    if (id === null || !(await deletePhrase(db, id))) return c.json(NOT_FOUND, 404);
+
+    return c.body(null, 204);
   });
 
   app.post('/api/push/subscribe', async (c) => {

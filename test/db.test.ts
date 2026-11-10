@@ -1,6 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   addPhrase,
+  deletePhrase,
   deleteSubscription,
   importPhrases,
   listRecent,
@@ -9,6 +10,7 @@ import {
   markShown,
   pickDailyPhrases,
   saveSubscription,
+  updatePhrase,
   type Db,
 } from '../src/db.js';
 import { clearTables, createTestDb, insertAged } from './helpers.js';
@@ -105,6 +107,46 @@ describe('addPhrase', () => {
     expect(phrase.text).toBe('It slipped my mind.');
     expect(phrase.createdAt).toBeInstanceOf(Date);
     expect(await pickDailyPhrases(db)).toEqual([]);
+  });
+});
+
+describe('updatePhrase', () => {
+  it('changes the text and keeps the creation date', async () => {
+    await insertAged(db, 'It slipt my mind.', 20);
+    const [before] = await listRecent(db);
+
+    const updated = await updatePhrase(db, before.id, 'It slipped my mind.');
+
+    expect(updated).toEqual({ ...before, text: 'It slipped my mind.' });
+    expect((await pickDailyPhrases(db)).map((p) => p.text)).toEqual(['It slipped my mind.']);
+  });
+
+  it('keeps a fixed phrase in Today', async () => {
+    await insertAged(db, 'It slipt my mind.', 20);
+    const [phrase] = await listRecent(db);
+    await markShown(db, [phrase.id]);
+
+    await updatePhrase(db, phrase.id, 'It slipped my mind.');
+
+    expect((await listToday(db)).map((p) => p.text)).toEqual(['It slipped my mind.']);
+  });
+
+  it('returns null when the phrase does not exist', async () => {
+    expect(await updatePhrase(db, 999, 'anything')).toBeNull();
+  });
+});
+
+describe('deletePhrase', () => {
+  it('removes only that phrase', async () => {
+    const keep = await addPhrase(db, 'keep me');
+    const remove = await addPhrase(db, 'remove me');
+
+    expect(await deletePhrase(db, remove.id)).toBe(true);
+    expect((await listRecent(db)).map((p) => p.id)).toEqual([keep.id]);
+  });
+
+  it('returns false when the phrase does not exist', async () => {
+    expect(await deletePhrase(db, 999)).toBe(false);
   });
 });
 

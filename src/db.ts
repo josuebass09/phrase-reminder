@@ -78,6 +78,24 @@ export async function addPhrase(db: Db, text: string): Promise<Phrase> {
   return rows[0];
 }
 
+/**
+ * Changes a phrase's text. Its dates stay as they are, so fixing a typo doesn't
+ * reset its 14-day wait or its place in the reminder queue.
+ */
+export async function updatePhrase(db: Db, id: number, text: string): Promise<Phrase | null> {
+  const { rows } = await db.query(
+    `UPDATE phrases SET text = $2 WHERE id = $1 RETURNING ${PHRASE_COLUMNS}`,
+    [id, text],
+  );
+  return rows[0] ?? null;
+}
+
+/** Returns false if no phrase had that id. */
+export async function deletePhrase(db: Db, id: number): Promise<boolean> {
+  const { rows } = await db.query('DELETE FROM phrases WHERE id = $1 RETURNING id', [id]);
+  return rows.length > 0;
+}
+
 export async function listRecent(db: Db, limit = 50): Promise<Phrase[]> {
   const { rows } = await db.query(
     `SELECT ${PHRASE_COLUMNS} FROM phrases ORDER BY created_at DESC, id DESC LIMIT $1`,

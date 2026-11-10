@@ -1,6 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.js';
 import {
+  addPhrase,
   listRecent,
   listSubscriptions,
   markShown,
@@ -32,6 +33,21 @@ function postPhrase(body: string, cookie?: string) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) },
     body,
+  });
+}
+
+function patchPhrase(id: number | string, body: string, cookie?: string) {
+  return app.request(`/api/phrases/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) },
+    body,
+  });
+}
+
+function deletePhraseRequest(id: number | string, cookie?: string) {
+  return app.request(`/api/phrases/${id}`, {
+    method: 'DELETE',
+    headers: cookie ? { Cookie: cookie } : {},
   });
 }
 
@@ -117,6 +133,85 @@ describe('POST /api/phrases', () => {
 
     expect(response.status).toBe(400);
     expect(await listRecent(db)).toEqual([]);
+  });
+});
+
+describe('PATCH /api/phrases/:id', () => {
+  it('rejects requests without a session and changes nothing', async () => {
+    const phrase = await addPhrase(db, 'It slipt my mind.');
+
+    const response = await patchPhrase(phrase.id, JSON.stringify({ text: 'It slipped my mind.' }));
+
+    expect(response.status).toBe(401);
+    expect((await listRecent(db)).map((p) => p.text)).toEqual(['It slipt my mind.']);
+  });
+
+  it('saves the trimmed text and returns the phrase', async () => {
+    const phrase = await addPhrase(db, 'It slipt my mind.');
+
+    const response = await patchPhrase(
+      phrase.id,
+      JSON.stringify({ text: '  It slipped my mind.  ' }),
+      await logIn(),
+    );
+    const updated = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(updated).toEqual({ id: phrase.id, text: 'It slipped my mind.', createdAt: phrase.createdAt.toISOString() });
+    expect((await listRecent(db)).map((p) => p.text)).toEqual(['It slipped my mind.']);
+  });
+
+  it.each([
+    ['blank text', JSON.stringify({ text: '   ' })],
+    ['text over the limit', JSON.stringify({ text: 'x'.repeat(MAX_PHRASE_LENGTH + 1) })],
+    ['a non-string value', JSON.stringify({ text: 42 })],
+    ['invalid JSON', 'not json'],
+  ])('rejects %s', async (_name, body) => {
+    const phrase = await addPhrase(db, 'It slipt my mind.');
+
+    const response = await patchPhrase(phrase.id, body, await logIn());
+
+    expect(response.status).toBe(400);
+    expect((await listRecent(db)).map((p) => p.text)).toEqual(['It slipt my mind.']);
+  });
+
+  it.each([
+    ['a missing phrase', '999'],
+    ['a non-numeric id', 'abc'],
+    ['an id beyond the integer range', '99999999999'],
+  ])('returns 404 for %s', async (_name, id) => {
+    const response = await patchPhrase(id, JSON.stringify({ text: 'Hello' }), await logIn());
+
+    expect(response.status).toBe(404);
+  });
+});
+
+describe('DELETE /api/phrases/:id', () => {
+  it('rejects requests without a session and deletes nothing', async () => {
+    const phrase = await addPhrase(db, 'keep me');
+
+    const response = await deletePhraseRequest(phrase.id);
+
+    expect(response.status).toBe(401);
+    expect(await listRecent(db)).toHaveLength(1);
+  });
+
+  it('deletes the phrase', async () => {
+    const phrase = await addPhrase(db, 'remove me');
+
+    const response = await deletePhraseRequest(phrase.id, await logIn());
+
+    expect(response.status).toBe(204);
+    expect(await listRecent(db)).toEqual([]);
+  });
+
+  it.each([
+    ['a missing phrase', '999'],
+    ['a non-numeric id', 'abc'],
+  ])('returns 404 for %s', async (_name, id) => {
+    const response = await deletePhraseRequest(id, await logIn());
+
+    expect(response.status).toBe(404);
   });
 });
 
