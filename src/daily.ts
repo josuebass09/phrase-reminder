@@ -9,7 +9,7 @@ import {
   type DeviceSubscription,
 } from './db.js';
 import { notificationPayload, type PushSender } from './push.js';
-import { dueReminderDay } from './schedule.js';
+import { dueReminderDay, localClock } from './schedule.js';
 
 export interface DailyResult {
   /** Users whose reminder was due and who had phrases old enough. */
@@ -76,7 +76,8 @@ export async function sendDueReminders(db: Db, send: PushSender, now = new Date(
     result.phrases += phrases.length;
     result.devices += subscriptions.length;
 
-    const delivered = await pushToDevices(db, send, subscriptions, notificationPayload(phrases), result.errors);
+    const payload = notificationPayload(phrases, localClock(now, candidate.timeZone).minutes);
+    const delivered = await pushToDevices(db, send, subscriptions, payload, result.errors);
     result.delivered += delivered;
     if (delivered > 0) {
       await markShown(db, phrases.map((phrase) => phrase.id));

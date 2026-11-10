@@ -1,7 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { sendDueReminders } from '../src/daily.js';
 import { getSettings, listSubscriptions, saveSubscription, updateSettings, type Db, type User } from '../src/db.js';
-import { notificationPayload } from '../src/push.js';
+import { greeting, notificationPayload } from '../src/push.js';
 import { clearTables, createTestDb, insertAged, insertUser } from './helpers.js';
 
 const phone = { endpoint: 'https://push.example/phone', p256dh: 'key-1', auth: 'auth-1' };
@@ -52,7 +52,7 @@ describe('sendDueReminders', () => {
     const result = await sendDueReminders(db, send, NOON);
 
     expect(result).toEqual({ users: 1, phrases: 1, devices: 2, delivered: 2, errors: [] });
-    expect(sentBodies(send)).toEqual({ [phone.endpoint]: 'old one', [laptop.endpoint]: 'old one' });
+    expect(sentBodies(send)).toEqual({ [phone.endpoint]: '• old one', [laptop.endpoint]: '• old one' });
     expect(await shownTexts()).toEqual(['old one']);
   });
 
@@ -66,7 +66,7 @@ describe('sendDueReminders', () => {
     const result = await sendDueReminders(db, send, NOON);
 
     expect(result).toMatchObject({ users: 2, phrases: 2, devices: 2, delivered: 2 });
-    expect(sentBodies(send)).toEqual({ [phone.endpoint]: "alice's phrase", [tablet.endpoint]: "bob's phrase" });
+    expect(sentBodies(send)).toEqual({ [phone.endpoint]: "• alice's phrase", [tablet.endpoint]: "• bob's phrase" });
   });
 
   it('skips users with no phrase old enough', async () => {
@@ -251,18 +251,50 @@ describe('reminder schedule', () => {
 });
 
 describe('notificationPayload', () => {
-  it('lists each phrase on its own line', () => {
-    const payload = JSON.parse(notificationPayload([{ text: 'First.' }, { text: 'Second.' }]));
+  const at = (hours: number, minutes = 0) => hours * 60 + minutes;
 
-    expect(payload.title).toBe('Your phrases for today');
-    expect(payload.body).toBe('First.\nSecond.');
+  it('greets for the time of day, says how many phrases, and bullets each one', () => {
+    const payload = JSON.parse(notificationPayload([{ text: 'First.' }, { text: 'Second.' }, { text: 'Third.' }], at(12, 5)));
+
+    expect(payload.title).toBe('☀️ Good afternoon! 3 phrases for today');
+    expect(payload.body).toBe('• First.\n• Second.\n• Third.');
   });
 
-  it('stays under the push size limit with the longest phrases allowed', () => {
-    const longPhrases = Array.from({ length: 3 }, () => ({ text: 'é'.repeat(500) }));
+  it.each([
+    [at(5), '🌅 Good morning!'],
+    [at(11, 59), '🌅 Good morning!'],
+    [at(12), '☀️ Good afternoon!'],
+    [at(17, 59), '☀️ Good afternoon!'],
+    [at(18), '🌙 Good evening!'],
+    [at(0, 30), '🌙 Good evening!'],
+    [at(4, 59), '🌙 Good evening!'],
+  ])('says %s minutes after midnight is %s', (minutes, expected) => {
+    expect(greeting(minutes)).toBe(expected);
+  });
 
-    const payload = notificationPayload(longPhrases);
+  it('says "1 phrase" for a single one', () => {
+    expect(JSON.parse(notificationPayload([{ text: 'Only.' }], at(8))).title).toBe('🌅 Good morning! 1 phrase for today');
+  });
 
-    expect(Buffer.byteLength(payload)).toBeLessThan(3000);
+  it.each([1, 3, 5])('stays under the push size limit with %i of the longest phrases allowed', (count) => {
+    const longPhrases = Array.from({ length: count }, () => ({ text: '語'.repeat(500) })); // 3 bytes each
+
+    const payload = notificationPayload(longPhrases, at(12));
+
+    expect(Buffer.byteLength(payload)).toBeLessThan(3200);
+    expect(JSON.parse(payload).body.split('\n').every((line: string) => line.endsWith('…'))).toBe(true);
+  });
+});
+
+describe('reminder notifications', () => {
+  it("greet for the user's local time when they go out", async () => {
+    await insertAged(db, alice.id, 'old one', 20);
+    await saveSubscription(db, alice.id, phone);
+    await updateSettings(db, alice.id, { reminderTime: '19:00', timeZone: 'Europe/Madrid' });
+    const send = vi.fn().mockResolvedValue(undefined);
+
+    await sendDueReminders(db, send, new Date('2026-11-10T18:05:00Z')); // 19:05 in Madrid
+
+    expect(JSON.parse(send.mock.calls[0][1])).toEqual({ title: '🌙 Good evening! 1 phrase for today', body: '• old one' });
   });
 });

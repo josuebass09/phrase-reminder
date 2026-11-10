@@ -52,6 +52,8 @@ Each user picks their reminder in the app's Settings: on or paused, the time, an
 
 The cron service runs every 15 minutes and sends each user's reminder once per local day, at the first run at or after their time, so it arrives within 15 minutes of it. If runs are missed, the next run within 3 hours still sends it; after that, the day is skipped. A reminder counts as sent once any of the user's devices received it, so a failed run is retried by the next one. Each run that finds nothing due logs `No reminders due`.
 
+The notification greets for the user's local time and says how many phrases there are, such as "☀️ Good afternoon! 3 phrases for today" (🌅 Good morning from 5:00, ☀️ Good afternoon from 12:00, 🌙 Good evening from 18:00), with one bulleted phrase per line. Long phrases are shortened so the notification stays within the push size limit.
+
 ## Users
 
 The first user is the admin. In the app, the admin opens the account sheet (the person icon) and taps **Invite someone** to get an invite link. Each link creates one account and expires after 7 days. Opening it shows the app's sign-up form with the code filled in, and the new account is a regular user. The database keeps only a hash of each code, so the link can't be shown again later; create a new one instead.
