@@ -20,7 +20,7 @@ Stack: TypeScript on Node, Hono, Railway Postgres, a Railway cron service, and W
 
 ## MVP Scope
 **In:**
-- Input page with a Today section (the latest reminder's phrases), a recent-phrases list, and a single password (1-year signed cookie)
+- Input page with a Today section (the latest reminder's phrases), a recent-phrases list, and a single password (1-year signed cookie). Later replaced by an app with user accounts: email and password, 12-hour access tokens, users created from a terminal
 - `phrases` and `push_subscriptions` tables
 - Button to turn on reminders on each device
 - Daily push notification at 12:00 Costa Rica time
@@ -32,8 +32,7 @@ Stack: TypeScript on Node, Hono, Railway Postgres, a Railway cron service, and W
 - **Quizzes:** the goal is simplicity. Reconsider only if the first assumption fails.
 - **Telegram bot:** the input page already covers saving.
 - **LLM meanings and examples:** adds cost and a dependency.
-- **Accounts:** there is only one user.
-- **Edit and delete screens:** fix typos directly in the database for now.
+- **Sign-up page:** users are created from a terminal, so nobody else can make an account.
 - **Native mobile app:** a web page with web push works on both devices.
 - **Email reminders:** replaced by push notifications.
 - **Saving offline:** a failed save shows an error and keeps the typed text.

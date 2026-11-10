@@ -1,5 +1,6 @@
-import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../src/app.js';
+import { createAccessToken } from '../src/auth.js';
 import {
   addPhrase,
   listRecent,
@@ -7,120 +8,173 @@ import {
   markShown,
   MAX_PHRASE_LENGTH,
   type Db,
+  type User,
 } from '../src/db.js';
-import { clearTables, createTestDb, insertAged } from './helpers.js';
+import { hashPassword } from '../src/passwords.js';
+import { clearTables, createTestDb, insertAged, insertUser } from './helpers.js';
 
 const PASSWORD = 'correct horse battery staple';
+const SECRET = 'test-secret-that-is-long-enough-for-hs256';
 
 let db: Db;
 let app: ReturnType<typeof createApp>;
+let passwordHash: string;
+let alice: User;
+let bob: User;
 
-function submitPassword(password: string, url = '/login') {
-  return app.request(url, {
+function login(body: unknown) {
+  return app.request('/api/login', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ password }).toString(),
+    headers: { 'Content-Type': 'application/json' },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
   });
 }
 
-async function logIn(): Promise<string> {
-  const response = await submitPassword(PASSWORD);
-  return response.headers.get('set-cookie')!.split(';')[0];
+async function bearer(user: User): Promise<string> {
+  return `Bearer ${(await createAccessToken(SECRET, user.id)).token}`;
 }
 
-function postPhrase(body: string, cookie?: string) {
-  return app.request('/api/phrases', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) },
-    body,
-  });
+/** Sends a request as a user, or with no Authorization header for null. */
+async function requestAs(user: User | null, path: string, init: { method?: string; body?: string } = {}) {
+  const headers: Record<string, string> = {};
+  if (user) headers.Authorization = await bearer(user);
+  if (init.body !== undefined) headers['Content-Type'] = 'application/json';
+  return app.request(path, { method: init.method ?? 'GET', headers, body: init.body });
 }
 
-function patchPhrase(id: number | string, body: string, cookie?: string) {
-  return app.request(`/api/phrases/${id}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) },
-    body,
-  });
-}
-
-function deletePhraseRequest(id: number | string, cookie?: string) {
-  return app.request(`/api/phrases/${id}`, {
-    method: 'DELETE',
-    headers: cookie ? { Cookie: cookie } : {},
-  });
-}
+const textOf = (phrases: { text: string }[]) => phrases.map((p) => p.text);
 
 beforeAll(async () => {
   db = await createTestDb();
-  app = createApp({
-    db,
-    password: PASSWORD,
-    sessionSecret: 'test-secret',
-    vapidPublicKey: 'test-public-key',
+  passwordHash = await hashPassword(PASSWORD);
+  app = createApp({ db, tokenSecret: SECRET, vapidPublicKey: 'test-public-key' });
+});
+
+beforeEach(async () => {
+  await clearTables(db);
+  alice = await insertUser(db, 'alice@example.com', passwordHash);
+  bob = await insertUser(db, 'bob@example.com', passwordHash);
+});
+
+afterEach(() => vi.useRealTimers());
+
+describe('POST /api/login', () => {
+  it('returns a 12-hour access token, its expiry, and the user', async () => {
+    const before = Date.now();
+    const response = await login({ email: 'alice@example.com', password: PASSWORD });
+    const after = Date.now();
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.user).toEqual({ id: alice.id, email: 'alice@example.com' });
+    expect(body.expiresIn).toBe(12 * 3600);
+    // Token times are whole seconds, so the expiry can fall up to a second before now + 12 hours.
+    const expiresAt = new Date(body.expiresAt).getTime();
+    expect(expiresAt).toBeGreaterThan(before + 12 * 3600_000 - 1000);
+    expect(expiresAt).toBeLessThanOrEqual(after + 12 * 3600_000);
+
+    const me = await app.request('/api/me', { headers: { Authorization: `Bearer ${body.token}` } });
+    expect(await me.json()).toEqual({ id: alice.id, email: 'alice@example.com' });
+  });
+
+  it('ignores case and spaces around the email', async () => {
+    const response = await login({ email: '  Alice@Example.COM ', password: PASSWORD });
+
+    expect(response.status).toBe(200);
+  });
+
+  it.each([
+    ['a wrong password', { email: 'alice@example.com', password: 'wrong password' }],
+    ['an unknown email', { email: 'nobody@example.com', password: PASSWORD }],
+    ['a password over the limit', { email: 'alice@example.com', password: 'x'.repeat(201) }],
+  ])('rejects %s with the same message', async (_name, body) => {
+    const response = await login(body);
+
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: 'Wrong email or password' });
+  });
+
+  it.each([
+    ['a missing email', { password: PASSWORD }],
+    ['a missing password', { email: 'alice@example.com' }],
+    ['a non-string password', { email: 'alice@example.com', password: 42 }],
+    ['invalid JSON', 'not json'],
+  ])('rejects %s as a bad request', async (_name, body) => {
+    const response = await login(body);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).not.toHaveProperty('token');
   });
 });
 
-beforeEach(() => clearTables(db));
+describe('access tokens', () => {
+  it('stop working after 12 hours', async () => {
+    // Only Date is faked: the in-process database relies on real timers.
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-10T12:00:00Z') });
+    const authorization = await bearer(alice);
 
-describe('login', () => {
-  it('sends visitors without a session to the login page', async () => {
-    const response = await app.request('/');
-
-    expect(response.status).toBe(302);
-    expect(response.headers.get('location')).toBe('/login');
+    vi.setSystemTime(new Date('2026-11-10T23:59:00Z'));
+    expect((await app.request('/api/me', { headers: { Authorization: authorization } })).status).toBe(200);
+    vi.setSystemTime(new Date('2026-11-11T00:00:01Z'));
+    expect((await app.request('/api/me', { headers: { Authorization: authorization } })).status).toBe(401);
   });
 
-  it('rejects a wrong password without setting a cookie', async () => {
-    const response = await submitPassword('wrong');
+  it.each([
+    ['no Authorization header', undefined],
+    ['another scheme', 'Basic YWxpY2U6cGFzc3dvcmQ='],
+    ['a forged token', 'Bearer forged'],
+  ])('are required: %s gets a 401', async (_name, authorization) => {
+    const response = await app.request('/api/me', { headers: authorization ? { Authorization: authorization } : {} });
 
     expect(response.status).toBe(401);
-    expect(response.headers.get('set-cookie')).toBeNull();
-    expect(await response.text()).toContain('Wrong password.');
   });
 
-  it('sets a one-year, HttpOnly, secure cookie for the right password', async () => {
-    const response = await submitPassword(PASSWORD, 'https://phrases.example/login');
-    const cookie = response.headers.get('set-cookie')!;
+  it('must be signed with this server’s secret', async () => {
+    const { token } = await createAccessToken('another-secret-that-is-also-long-enough', alice.id);
 
-    expect(response.status).toBe(302);
-    expect(response.headers.get('location')).toBe('/');
-    expect(cookie).toContain('Max-Age=31536000');
-    expect(cookie).toContain('HttpOnly');
-    expect(cookie).toContain('Secure');
-    expect(cookie).toContain('SameSite=Lax');
+    const response = await app.request('/api/me', { headers: { Authorization: `Bearer ${token}` } });
+
+    expect(response.status).toBe(401);
   });
 
-  it('accepts the session cookie on later requests', async () => {
-    const response = await app.request('/', { headers: { Cookie: await logIn() } });
+  it('stop working when their user is deleted', async () => {
+    const authorization = await bearer(alice);
+    await db.query('DELETE FROM users WHERE id = $1', [alice.id]);
 
-    expect(response.status).toBe(200);
-    expect(await response.text()).toContain('id="phrase-form"');
+    const response = await app.request('/api/phrases', { headers: { Authorization: authorization } });
+
+    expect(response.status).toBe(401);
   });
+});
 
-  it('rejects a forged session cookie', async () => {
-    const response = await app.request('/', { headers: { Cookie: 'session=ok' } });
+describe('GET /api/me', () => {
+  it('returns the logged-in user without the password hash', async () => {
+    const response = await requestAs(bob, '/api/me');
 
-    expect(response.status).toBe(302);
+    expect(await response.json()).toEqual({ id: bob.id, email: 'bob@example.com' });
   });
 });
 
 describe('POST /api/phrases', () => {
-  it('rejects requests without a session and saves nothing', async () => {
-    const response = await postPhrase(JSON.stringify({ text: 'Hello' }));
+  it('rejects requests without a token and saves nothing', async () => {
+    const response = await requestAs(null, '/api/phrases', { method: 'POST', body: JSON.stringify({ text: 'Hello' }) });
 
     expect(response.status).toBe(401);
-    expect(await listRecent(db)).toEqual([]);
+    expect(await listRecent(db, alice.id)).toEqual([]);
   });
 
-  it('saves the trimmed phrase and returns it', async () => {
-    const response = await postPhrase(JSON.stringify({ text: "  I'll keep you posted.  " }), await logIn());
+  it("saves the trimmed phrase for the user and returns it", async () => {
+    const response = await requestAs(alice, '/api/phrases', {
+      method: 'POST',
+      body: JSON.stringify({ text: "  I'll keep you posted.  " }),
+    });
     const phrase = await response.json();
 
     expect(response.status).toBe(201);
     expect(phrase.text).toBe("I'll keep you posted.");
     expect(new Date(phrase.createdAt).getTime()).not.toBeNaN();
-    expect((await listRecent(db)).map((p) => p.text)).toEqual(["I'll keep you posted."]);
+    expect(textOf(await listRecent(db, alice.id))).toEqual(["I'll keep you posted."]);
+    expect(await listRecent(db, bob.id)).toEqual([]);
   });
 
   it.each([
@@ -129,36 +183,62 @@ describe('POST /api/phrases', () => {
     ['a non-string value', JSON.stringify({ text: 42 })],
     ['invalid JSON', 'not json'],
   ])('rejects %s', async (_name, body) => {
-    const response = await postPhrase(body, await logIn());
+    const response = await requestAs(alice, '/api/phrases', { method: 'POST', body });
 
     expect(response.status).toBe(400);
-    expect(await listRecent(db)).toEqual([]);
+    expect(await listRecent(db, alice.id)).toEqual([]);
+  });
+});
+
+describe('GET /api/phrases', () => {
+  it('rejects requests without a token', async () => {
+    expect((await requestAs(null, '/api/phrases')).status).toBe(401);
+  });
+
+  it("returns only the user's phrases, newest first", async () => {
+    await insertAged(db, alice.id, 'older', 2);
+    await insertAged(db, alice.id, 'newer', 1);
+    await insertAged(db, bob.id, "bob's", 0);
+
+    const phrases = await (await requestAs(alice, '/api/phrases')).json();
+
+    expect(textOf(phrases)).toEqual(['newer', 'older']);
+    expect(phrases[0]).toEqual({ id: expect.any(Number), text: 'newer', createdAt: expect.any(String) });
   });
 });
 
 describe('PATCH /api/phrases/:id', () => {
-  it('rejects requests without a session and changes nothing', async () => {
-    const phrase = await addPhrase(db, 'It slipt my mind.');
+  const fix = JSON.stringify({ text: '  It slipped my mind.  ' });
 
-    const response = await patchPhrase(phrase.id, JSON.stringify({ text: 'It slipped my mind.' }));
+  it('rejects requests without a token and changes nothing', async () => {
+    const phrase = await addPhrase(db, alice.id, 'It slipt my mind.');
+
+    const response = await requestAs(null, `/api/phrases/${phrase.id}`, { method: 'PATCH', body: fix });
 
     expect(response.status).toBe(401);
-    expect((await listRecent(db)).map((p) => p.text)).toEqual(['It slipt my mind.']);
+    expect(textOf(await listRecent(db, alice.id))).toEqual(['It slipt my mind.']);
   });
 
   it('saves the trimmed text and returns the phrase', async () => {
-    const phrase = await addPhrase(db, 'It slipt my mind.');
+    const phrase = await addPhrase(db, alice.id, 'It slipt my mind.');
 
-    const response = await patchPhrase(
-      phrase.id,
-      JSON.stringify({ text: '  It slipped my mind.  ' }),
-      await logIn(),
-    );
-    const updated = await response.json();
+    const response = await requestAs(alice, `/api/phrases/${phrase.id}`, { method: 'PATCH', body: fix });
 
     expect(response.status).toBe(200);
-    expect(updated).toEqual({ id: phrase.id, text: 'It slipped my mind.', createdAt: phrase.createdAt.toISOString() });
-    expect((await listRecent(db)).map((p) => p.text)).toEqual(['It slipped my mind.']);
+    expect(await response.json()).toEqual({
+      id: phrase.id,
+      text: 'It slipped my mind.',
+      createdAt: phrase.createdAt.toISOString(),
+    });
+  });
+
+  it("returns 404 for another user's phrase and leaves it alone", async () => {
+    const phrase = await addPhrase(db, alice.id, 'It slipt my mind.');
+
+    const response = await requestAs(bob, `/api/phrases/${phrase.id}`, { method: 'PATCH', body: fix });
+
+    expect(response.status).toBe(404);
+    expect(textOf(await listRecent(db, alice.id))).toEqual(['It slipt my mind.']);
   });
 
   it.each([
@@ -167,12 +247,12 @@ describe('PATCH /api/phrases/:id', () => {
     ['a non-string value', JSON.stringify({ text: 42 })],
     ['invalid JSON', 'not json'],
   ])('rejects %s', async (_name, body) => {
-    const phrase = await addPhrase(db, 'It slipt my mind.');
+    const phrase = await addPhrase(db, alice.id, 'It slipt my mind.');
 
-    const response = await patchPhrase(phrase.id, body, await logIn());
+    const response = await requestAs(alice, `/api/phrases/${phrase.id}`, { method: 'PATCH', body });
 
     expect(response.status).toBe(400);
-    expect((await listRecent(db)).map((p) => p.text)).toEqual(['It slipt my mind.']);
+    expect(textOf(await listRecent(db, alice.id))).toEqual(['It slipt my mind.']);
   });
 
   it.each([
@@ -180,38 +260,72 @@ describe('PATCH /api/phrases/:id', () => {
     ['a non-numeric id', 'abc'],
     ['an id beyond the integer range', '99999999999'],
   ])('returns 404 for %s', async (_name, id) => {
-    const response = await patchPhrase(id, JSON.stringify({ text: 'Hello' }), await logIn());
+    const response = await requestAs(alice, `/api/phrases/${id}`, { method: 'PATCH', body: fix });
 
     expect(response.status).toBe(404);
   });
 });
 
 describe('DELETE /api/phrases/:id', () => {
-  it('rejects requests without a session and deletes nothing', async () => {
-    const phrase = await addPhrase(db, 'keep me');
+  it('rejects requests without a token and deletes nothing', async () => {
+    const phrase = await addPhrase(db, alice.id, 'keep me');
 
-    const response = await deletePhraseRequest(phrase.id);
+    const response = await requestAs(null, `/api/phrases/${phrase.id}`, { method: 'DELETE' });
 
     expect(response.status).toBe(401);
-    expect(await listRecent(db)).toHaveLength(1);
+    expect(await listRecent(db, alice.id)).toHaveLength(1);
   });
 
   it('deletes the phrase', async () => {
-    const phrase = await addPhrase(db, 'remove me');
+    const phrase = await addPhrase(db, alice.id, 'remove me');
 
-    const response = await deletePhraseRequest(phrase.id, await logIn());
+    const response = await requestAs(alice, `/api/phrases/${phrase.id}`, { method: 'DELETE' });
 
     expect(response.status).toBe(204);
-    expect(await listRecent(db)).toEqual([]);
+    expect(await listRecent(db, alice.id)).toEqual([]);
+  });
+
+  it("returns 404 for another user's phrase and keeps it", async () => {
+    const phrase = await addPhrase(db, alice.id, 'keep me');
+
+    const response = await requestAs(bob, `/api/phrases/${phrase.id}`, { method: 'DELETE' });
+
+    expect(response.status).toBe(404);
+    expect(await listRecent(db, alice.id)).toHaveLength(1);
   });
 
   it.each([
     ['a missing phrase', '999'],
     ['a non-numeric id', 'abc'],
   ])('returns 404 for %s', async (_name, id) => {
-    const response = await deletePhraseRequest(id, await logIn());
+    const response = await requestAs(alice, `/api/phrases/${id}`, { method: 'DELETE' });
 
     expect(response.status).toBe(404);
+  });
+});
+
+describe('GET /api/today', () => {
+  async function sendPhrase(user: User, text: string) {
+    await insertAged(db, user.id, text, 20);
+    const [phrase] = await listRecent(db, user.id, 1);
+    await markShown(db, [phrase.id]);
+  }
+
+  it('rejects requests without a token', async () => {
+    expect((await requestAs(null, '/api/today')).status).toBe(401);
+  });
+
+  it("returns the phrases from the user's latest reminder", async () => {
+    await sendPhrase(alice, 'It slipped my mind.');
+    await sendPhrase(bob, "Bob's phrase.");
+
+    const response = await requestAs(alice, '/api/today');
+    const phrases = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(textOf(phrases)).toEqual(['It slipped my mind.']);
+    expect(phrases[0].id).toEqual(expect.any(Number));
+    expect(new Date(phrases[0].createdAt).getTime()).not.toBeNaN();
   });
 });
 
@@ -222,28 +336,31 @@ describe('POST /api/push/subscribe', () => {
     keys: { p256dh: 'public-key', auth: 'auth-secret' },
   };
 
-  function postSubscription(body: string, cookie?: string) {
-    return app.request('/api/push/subscribe', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) },
-      body,
-    });
-  }
+  const subscribe = (user: User | null, body: string) =>
+    requestAs(user, '/api/push/subscribe', { method: 'POST', body });
 
-  it('rejects requests without a session and saves nothing', async () => {
-    const response = await postSubscription(JSON.stringify(subscription));
+  it('rejects requests without a token and saves nothing', async () => {
+    const response = await subscribe(null, JSON.stringify(subscription));
 
     expect(response.status).toBe(401);
-    expect(await listSubscriptions(db)).toEqual([]);
+    expect(await listSubscriptions(db, alice.id)).toEqual([]);
   });
 
-  it('saves a browser subscription', async () => {
-    const response = await postSubscription(JSON.stringify(subscription), await logIn());
+  it("saves the browser's subscription for the user", async () => {
+    const response = await subscribe(alice, JSON.stringify(subscription));
 
     expect(response.status).toBe(204);
-    expect(await listSubscriptions(db)).toEqual([
+    expect(await listSubscriptions(db, alice.id)).toEqual([
       { endpoint: subscription.endpoint, p256dh: 'public-key', auth: 'auth-secret' },
     ]);
+  });
+
+  it('moves the device to whoever subscribes it next', async () => {
+    await subscribe(alice, JSON.stringify(subscription));
+    await subscribe(bob, JSON.stringify(subscription));
+
+    expect(await listSubscriptions(db, alice.id)).toEqual([]);
+    expect(await listSubscriptions(db, bob.id)).toHaveLength(1);
   });
 
   it.each([
@@ -252,168 +369,25 @@ describe('POST /api/push/subscribe', () => {
     ['empty keys', JSON.stringify({ ...subscription, keys: { p256dh: '', auth: '' } })],
     ['invalid JSON', 'not json'],
   ])('rejects %s', async (_name, body) => {
-    const response = await postSubscription(body, await logIn());
+    const response = await subscribe(alice, body);
 
     expect(response.status).toBe(400);
-    expect(await listSubscriptions(db)).toEqual([]);
-  });
-});
-
-describe('Today', () => {
-  async function sendPhrase(text: string) {
-    await insertAged(db, text, 20);
-    const [phrase] = await listRecent(db, 1);
-    await markShown(db, [phrase.id]);
-  }
-
-  it('rejects GET /api/today without a session', async () => {
-    const response = await app.request('/api/today');
-
-    expect(response.status).toBe(401);
-  });
-
-  it('returns the phrases from the latest reminder', async () => {
-    await sendPhrase('It slipped my mind.');
-
-    const response = await app.request('/api/today', { headers: { Cookie: await logIn() } });
-    const phrases = await response.json();
-
-    expect(response.status).toBe(200);
-    expect(phrases.map((p: { text: string }) => p.text)).toEqual(['It slipped my mind.']);
-    expect(phrases[0].id).toEqual(expect.any(Number));
-    expect(new Date(phrases[0].createdAt).getTime()).not.toBeNaN();
-  });
-
-  it('shows the section on the page when a reminder went out', async () => {
-    await sendPhrase('It slipped my mind.');
-
-    const html = await (await app.request('/', { headers: { Cookie: await logIn() } })).text();
-
-    expect(html).toContain('<section id="today" class="group">');
-    expect(html).toMatch(/id="today-phrases"[^>]*>.*It slipped my mind\./);
-  });
-
-  it('hides the section when no reminder went out', async () => {
-    const html = await (await app.request('/', { headers: { Cookie: await logIn() } })).text();
-
-    expect(html).toContain('<section id="today" class="group" hidden>');
-  });
-});
-
-describe('GET /', () => {
-  it('gives the page the public push key', async () => {
-    const html = await (await app.request('/', { headers: { Cookie: await logIn() } })).text();
-
-    expect(html).toContain('data-vapid-key="test-public-key"');
-  });
-
-  it('escapes saved phrases so they cannot inject HTML', async () => {
-    const cookie = await logIn();
-    await postPhrase(JSON.stringify({ text: '<script>alert(1)</script>' }), cookie);
-
-    const html = await (await app.request('/', { headers: { Cookie: cookie } })).text();
-
-    expect(html).not.toContain('<script>alert(1)</script>');
-    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
-  });
-
-  it('uses the Android style on Android and the iOS style elsewhere', async () => {
-    const cookie = await logIn();
-    const htmlFor = async (userAgent: string) =>
-      (await app.request('/', { headers: { Cookie: cookie, 'User-Agent': userAgent } })).text();
-
-    expect(await htmlFor('Mozilla/5.0 (Linux; Android 14)')).toContain('data-platform="android"');
-    expect(await htmlFor('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0)')).toContain('data-platform="ios"');
-  });
-
-  it('only allows scripts and styles from the app itself', async () => {
-    const response = await app.request('/login');
-
-    expect(response.headers.get('content-security-policy')).toContain("default-src 'self'");
-  });
-});
-
-function requestToken(body: string) {
-  return app.request('/api/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body,
-  });
-}
-
-async function bearer(): Promise<string> {
-  const { token } = await (await requestToken(JSON.stringify({ password: PASSWORD }))).json();
-  return `Bearer ${token}`;
-}
-
-describe('POST /api/login', () => {
-  it('returns a token that authorizes API requests', async () => {
-    const response = await requestToken(JSON.stringify({ password: PASSWORD }));
-    const { token } = await response.json();
-
-    expect(response.status).toBe(200);
-    expect(token).toEqual(expect.any(String));
-    const phrases = await app.request('/api/phrases', { headers: { Authorization: `Bearer ${token}` } });
-    expect(phrases.status).toBe(200);
-  });
-
-  it.each([
-    ['a wrong password', JSON.stringify({ password: 'wrong' })],
-    ['a missing password', JSON.stringify({})],
-    ['invalid JSON', 'not json'],
-  ])('rejects %s without a token', async (_name, body) => {
-    const response = await requestToken(body);
-
-    expect(response.status).toBe(401);
-    expect(await response.json()).not.toHaveProperty('token');
-  });
-
-  it('lets a token save, edit, and delete phrases', async () => {
-    const authorization = await bearer();
-    const headers = { Authorization: authorization, 'Content-Type': 'application/json' };
-
-    const created = await app.request('/api/phrases', { method: 'POST', headers, body: JSON.stringify({ text: 'Hi' }) });
-    const { id } = await created.json();
-    const edited = await app.request(`/api/phrases/${id}`, { method: 'PATCH', headers, body: JSON.stringify({ text: 'Hello' }) });
-    const deleted = await app.request(`/api/phrases/${id}`, { method: 'DELETE', headers });
-
-    expect([created.status, edited.status, deleted.status]).toEqual([201, 200, 204]);
-  });
-
-  it('judges a request with an Authorization header on the token alone', async () => {
-    const response = await app.request('/api/phrases', {
-      headers: { Authorization: 'Bearer forged', Cookie: await logIn() },
-    });
-
-    expect(response.status).toBe(401);
-  });
-});
-
-describe('GET /api/phrases', () => {
-  it('rejects requests without a session', async () => {
-    const response = await app.request('/api/phrases');
-
-    expect(response.status).toBe(401);
-  });
-
-  it('returns recent phrases, newest first', async () => {
-    await insertAged(db, 'older', 2);
-    await insertAged(db, 'newer', 1);
-
-    const response = await app.request('/api/phrases', { headers: { Authorization: await bearer() } });
-    const phrases = await response.json();
-
-    expect(phrases.map((p: { text: string }) => p.text)).toEqual(['newer', 'older']);
-    expect(phrases[0]).toEqual({ id: expect.any(Number), text: 'newer', createdAt: expect.any(String) });
+    expect(await listSubscriptions(db, alice.id)).toEqual([]);
   });
 });
 
 describe('GET /api/config', () => {
-  it('gives the public push key without a session', async () => {
+  it('gives the public push key without a token', async () => {
     const response = await app.request('/api/config');
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ vapidPublicKey: 'test-public-key' });
+  });
+
+  it('forbids the response from loading anything or being framed', async () => {
+    const response = await app.request('/api/config');
+
+    expect(response.headers.get('content-security-policy')).toBe("default-src 'none'; frame-ancestors 'none'");
   });
 });
 
@@ -432,7 +406,7 @@ describe('CORS', () => {
   }
 
   function appWithOrigins(appOrigins?: string[]) {
-    return createApp({ db, password: PASSWORD, sessionSecret: 'test-secret', vapidPublicKey: 'k', appOrigins });
+    return createApp({ db, tokenSecret: SECRET, vapidPublicKey: 'k', appOrigins });
   }
 
   it('lets the configured app origin call the API', async () => {

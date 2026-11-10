@@ -12,9 +12,9 @@
     "start": "node dist/server.js",
     "send-daily": "node dist/send-daily.js",
     "import": "tsx --env-file=.env src/import-phrases.ts",
-    "icons": "node scripts/make-icons.mjs",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "users": "tsx --env-file=.env src/users.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.0",
@@ -27,7 +27,6 @@
     "@types/node": "^22.10.0",
     "@types/pg": "^8.11.0",
     "@types/web-push": "^3.6.4",
-    "sharp": "^0.33.5",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"

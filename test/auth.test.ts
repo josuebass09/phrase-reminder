@@ -1,41 +1,65 @@
-import { describe, expect, it } from 'vitest';
-import { createToken, TOKEN_LIFETIME_SECONDS, verifyToken } from '../src/auth.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { sign } from 'hono/jwt';
+import { ACCESS_TOKEN_LIFETIME_SECONDS, createAccessToken, readAccessToken } from '../src/auth.js';
 
-const SECRET = 'test-secret';
-const NOW = Date.UTC(2026, 10, 10);
+const SECRET = 'test-secret-that-is-long-enough-for-hs256';
 
-describe('tokens', () => {
-  it('accepts a token it created', () => {
-    expect(verifyToken(SECRET, createToken(SECRET, NOW), NOW)).toBe(true);
+afterEach(() => vi.useRealTimers());
+
+describe('access tokens', () => {
+  it('last 12 hours', () => {
+    expect(ACCESS_TOKEN_LIFETIME_SECONDS).toBe(12 * 60 * 60);
   });
 
-  it('accepts a token until it expires a year later', () => {
-    const token = createToken(SECRET, NOW);
-    const lifetime = TOKEN_LIFETIME_SECONDS * 1000;
+  it('carry the user id and report when they expire', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-10T12:00:00Z') });
 
-    expect(verifyToken(SECRET, token, NOW + lifetime - 1000)).toBe(true);
-    expect(verifyToken(SECRET, token, NOW + lifetime)).toBe(false);
+    const { token, expiresAt } = await createAccessToken(SECRET, 42);
+
+    expect(await readAccessToken(SECRET, token)).toBe(42);
+    expect(expiresAt.toISOString()).toBe('2026-11-11T00:00:00.000Z');
   });
 
-  it('rejects a token signed with another secret', () => {
-    expect(verifyToken(SECRET, createToken('other-secret', NOW), NOW)).toBe(false);
+  it('stop working once 12 hours have passed', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-10T12:00:00Z') });
+    const { token } = await createAccessToken(SECRET, 42);
+
+    vi.setSystemTime(new Date('2026-11-10T23:59:59Z'));
+    expect(await readAccessToken(SECRET, token)).toBe(42);
+    vi.setSystemTime(new Date('2026-11-11T00:00:01Z'));
+    expect(await readAccessToken(SECRET, token)).toBeNull();
   });
 
-  it('rejects a token whose expiry was changed', () => {
-    const [version, expires, signature] = createToken(SECRET, NOW).split('.');
-    const extended = `${version}.${Number(expires) + 1_000_000}.${signature}`;
+  it('reject a token signed with another secret', async () => {
+    const { token } = await createAccessToken('another-secret-that-is-also-long-enough', 42);
 
-    expect(verifyToken(SECRET, extended, NOW)).toBe(false);
+    expect(await readAccessToken(SECRET, token)).toBeNull();
   });
 
-  it.each([
-    ['an empty string', ''],
-    ['a session cookie value', 'ok'],
-    ['too few parts', 'v1.123'],
-    ['too many parts', 'v1.123.abc.def'],
-    ['another version', 'v2.9999999999.abc'],
-    ['a non-numeric expiry', 'v1.soon.abc'],
-  ])('rejects %s', (_name, token) => {
-    expect(verifyToken(SECRET, token, NOW)).toBe(false);
+  it('reject a token whose payload was changed', async () => {
+    const { token } = await createAccessToken(SECRET, 42);
+    const [header, , signature] = token.split('.');
+    const payload = Buffer.from(JSON.stringify({ sub: '1', exp: 9_999_999_999 })).toString('base64url');
+
+    expect(await readAccessToken(SECRET, `${header}.${payload}.${signature}`)).toBeNull();
+  });
+
+  it('reject an unsigned token', async () => {
+    const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({ sub: '42', exp: 9_999_999_999 })).toString('base64url');
+
+    expect(await readAccessToken(SECRET, `${header}.${payload}.`)).toBeNull();
+  });
+
+  it('reject a token without an expiry or a numeric user id', async () => {
+    const noExpiry = await sign({ sub: '42' }, SECRET, 'HS256');
+    const badSubject = await sign({ sub: 'admin', exp: 9_999_999_999 }, SECRET, 'HS256');
+
+    expect(await readAccessToken(SECRET, badSubject)).toBeNull();
+    expect(await readAccessToken(SECRET, noExpiry)).toBeNull();
+  });
+
+  it.each(['', 'garbage', 'a.b.c', 'v1.9999999999.signature'])('reject %j', async (token) => {
+    expect(await readAccessToken(SECRET, token)).toBeNull();
   });
 });

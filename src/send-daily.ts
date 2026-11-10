@@ -14,14 +14,12 @@ const db = connect(requireEnv('DATABASE_URL'));
 
 try {
   await ensureSchema(db);
-  const { phrases, devices, delivered, errors } = await sendDailyPhrases(db, send);
+  const { users, phrases, devices, delivered, errors } = await sendDailyPhrases(db, send);
 
-  if (phrases === 0) {
-    console.log('No phrases old enough yet, so nothing was sent');
-  } else if (devices === 0) {
-    console.log('No device has reminders turned on, so nothing was sent');
+  if (users === 0) {
+    console.log('Nothing was sent: no user has both reminders turned on and phrases at least 14 days old');
   } else {
-    console.log(`Sent ${phrases} phrases to ${delivered} of ${devices} devices`);
+    console.log(`Sent ${phrases} phrases to ${delivered} of ${devices} devices, for ${users} users`);
   }
 
   for (const error of errors) console.error(error);
