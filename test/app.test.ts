@@ -330,6 +330,86 @@ describe('GET /api/today', () => {
   });
 });
 
+describe('GET /api/phrases/:id/translation', () => {
+  function appWith(translate?: (text: string) => Promise<string>) {
+    return createApp({ db, tokenSecret: SECRET, vapidPublicKey: 'k', translate });
+  }
+
+  async function ask(target: ReturnType<typeof createApp>, user: User | null, id: number | string) {
+    const headers: Record<string, string> = user ? { Authorization: await bearer(user) } : {};
+    return target.request(`/api/phrases/${id}/translation`, { headers });
+  }
+
+  it('translates the phrase once and then serves the saved translation', async () => {
+    const translate = vi.fn(async (text: string) => `es: ${text}`);
+    const target = appWith(translate);
+    const phrase = await addPhrase(db, alice.id, "I'll keep you posted.");
+
+    const first = await ask(target, alice, phrase.id);
+    const second = await ask(target, alice, phrase.id);
+
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({ translation: "es: I'll keep you posted." });
+    expect(await second.json()).toEqual({ translation: "es: I'll keep you posted." });
+    expect(translate).toHaveBeenCalledTimes(1);
+  });
+
+  it('translates again after the phrase is edited', async () => {
+    const translate = vi.fn(async (text: string) => `es: ${text}`);
+    const target = appWith(translate);
+    const phrase = await addPhrase(db, alice.id, 'It slipt my mind.');
+    await ask(target, alice, phrase.id);
+
+    await requestAs(alice, `/api/phrases/${phrase.id}`, { method: 'PATCH', body: JSON.stringify({ text: 'It slipped my mind.' }) });
+    const response = await ask(target, alice, phrase.id);
+
+    expect(await response.json()).toEqual({ translation: 'es: It slipped my mind.' });
+    expect(translate).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns 404 for another user's phrase, a missing one, or a bad id, without translating", async () => {
+    const translate = vi.fn(async () => 'nope');
+    const target = appWith(translate);
+    const phrase = await addPhrase(db, alice.id, 'mine');
+
+    const statuses = [
+      (await ask(target, bob, phrase.id)).status,
+      (await ask(target, alice, 999)).status,
+      (await ask(target, alice, 'abc')).status,
+    ];
+
+    expect(statuses).toEqual([404, 404, 404]);
+    expect(translate).not.toHaveBeenCalled();
+  });
+
+  it('requires a token', async () => {
+    const phrase = await addPhrase(db, alice.id, 'mine');
+
+    expect((await ask(appWith(async () => 'x'), null, phrase.id)).status).toBe(401);
+  });
+
+  it('answers 502 and saves nothing when the translation service fails', async () => {
+    const translate = vi.fn().mockRejectedValueOnce(new Error('quota')).mockResolvedValueOnce('Hola.');
+    const target = appWith(translate);
+    const phrase = await addPhrase(db, alice.id, 'Hello.');
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const failed = await ask(target, alice, phrase.id);
+    const retried = await ask(target, alice, phrase.id);
+    quiet.mockRestore();
+
+    expect(failed.status).toBe(502);
+    expect(await failed.json()).toEqual({ error: "Couldn't translate right now" });
+    expect(await retried.json()).toEqual({ translation: 'Hola.' });
+  });
+
+  it('answers 503 when no translator is set up', async () => {
+    const phrase = await addPhrase(db, alice.id, 'Hello.');
+
+    expect((await ask(appWith(), alice, phrase.id)).status).toBe(503);
+  });
+});
+
 describe('POST /api/push/subscribe', () => {
   const subscription = {
     endpoint: 'https://push.example/device',

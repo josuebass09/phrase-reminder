@@ -34,7 +34,7 @@ Railway deploys from this repository, so push it to GitHub first. All settings b
 3. Add a **web service** from this repository:
    - Build command: `npm run build`
    - Start command: `npm start`
-   - Variables: `DATABASE_URL` (reference the Postgres service), `SESSION_SECRET`, `VAPID_PUBLIC_KEY`, and `APP_ORIGIN` once the app has a domain
+   - Variables: `DATABASE_URL` (reference the Postgres service), `SESSION_SECRET`, `VAPID_PUBLIC_KEY`, `APP_ORIGIN` once the app has a domain, and optionally `MYMEMORY_EMAIL` (see Translations)
    - Generate a public domain under Networking.
 4. Add a **cron service** from the same repository:
    - Build command: `npm run build`
@@ -86,9 +86,16 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `POST /api/phrases` with `{ text }` | Yes | The saved phrase, 201 |
 | `PATCH /api/phrases/:id` with `{ text }` | Yes | The updated phrase, or 404 |
 | `DELETE /api/phrases/:id` | Yes | 204, or 404 |
+| `GET /api/phrases/:id/translation` | Yes | `{ translation }` in Spanish, or 404. 502 if the translation service fails |
 | `POST /api/push/subscribe` with a `PushSubscription` | Yes | 204 |
 
 Send the token as `Authorization: Bearer <token>`. It's a JWT signed with `SESSION_SECRET`, and `expiresIn` is its lifetime in seconds (43200). Without a valid token, these requests get a 401. Phrases look like `{ id, text, createdAt }`. Another user's phrase gets the same 404 as a missing one.
+
+## Translations
+
+The app can show each phrase in Spanish. The backend asks [MyMemory](https://mymemory.translated.net/), a free translation API that needs no key or account, the first time someone asks for a phrase, and saves the result with the phrase. Later requests come from the database, and editing the phrase's text drops the saved translation.
+
+MyMemory's free limit is about 5,000 characters a day per server. Set `MYMEMORY_EMAIL` on the web service to a contact email to raise it to about 50,000. Since each phrase is translated once, either is usually plenty. When the limit runs out, the app says it couldn't translate, and the phrase can be translated the next day.
 
 ## Import your current file
 

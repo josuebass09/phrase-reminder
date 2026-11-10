@@ -102,6 +102,8 @@ export async function ensureSchema(db: Db): Promise<void> {
     'ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users (id) ON DELETE CASCADE',
   );
   await db.query('CREATE INDEX IF NOT EXISTS phrases_user_id_created_at ON phrases (user_id, created_at)');
+  // The Spanish translation, saved the first time someone asks, so each phrase is translated once.
+  await db.query('ALTER TABLE phrases ADD COLUMN IF NOT EXISTS translation_es TEXT');
   await db.query('CREATE INDEX IF NOT EXISTS push_subscriptions_user_id ON push_subscriptions (user_id)');
 }
 
@@ -260,15 +262,47 @@ export async function addPhrase(db: Db, userId: number, text: string): Promise<P
 
 /**
  * Changes a phrase's text. Its dates stay as they are, so fixing a typo doesn't
- * reset its 14-day wait or its place in the reminder queue. Returns null if the
- * user has no phrase with that id.
+ * reset its 14-day wait or its place in the reminder queue. A new text drops the
+ * saved translation. Returns null if the user has no phrase with that id.
  */
 export async function updatePhrase(db: Db, userId: number, id: number, text: string): Promise<Phrase | null> {
   const { rows } = await db.query(
-    `UPDATE phrases SET text = $3 WHERE id = $2 AND user_id = $1 RETURNING ${PHRASE_COLUMNS}`,
+    `UPDATE phrases
+     SET text = $3, translation_es = CASE WHEN text = $3 THEN translation_es END
+     WHERE id = $2 AND user_id = $1
+     RETURNING ${PHRASE_COLUMNS}`,
     [userId, id, text],
   );
   return rows[0] ?? null;
+}
+
+/** A phrase's text and saved translation, or null if the user has no phrase with that id. */
+export async function findPhraseTranslation(
+  db: Db,
+  userId: number,
+  id: number,
+): Promise<{ text: string; translation: string | null } | null> {
+  const { rows } = await db.query(
+    'SELECT text, translation_es AS translation FROM phrases WHERE id = $2 AND user_id = $1',
+    [userId, id],
+  );
+  return rows[0] ?? null;
+}
+
+/** Saves a translation, unless the phrase's text changed while it was being translated. */
+export async function saveTranslation(
+  db: Db,
+  userId: number,
+  id: number,
+  text: string,
+  translation: string,
+): Promise<void> {
+  await db.query('UPDATE phrases SET translation_es = $4 WHERE id = $2 AND user_id = $1 AND text = $3', [
+    userId,
+    id,
+    text,
+    translation,
+  ]);
 }
 
 /** Returns false if the user had no phrase with that id. */

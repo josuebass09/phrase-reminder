@@ -2,6 +2,7 @@ import { serve } from '@hono/node-server';
 import { createApp } from './app.js';
 import { connect, ensureSchema } from './db.js';
 import { requireEnv } from './env.js';
+import { createMyMemoryTranslator } from './translate.js';
 
 const tokenSecret = requireEnv('SESSION_SECRET');
 // HS256 is only as strong as its key. `openssl rand -base64 32` gives 44 characters.
@@ -19,6 +20,8 @@ const app = createApp({
     .split(',')
     .map((origin) => origin.trim().replace(/\/+$/, ''))
     .filter(Boolean),
+  // Optional. Raises MyMemory's free daily limit from about 5,000 to 50,000 characters.
+  translate: createMyMemoryTranslator({ email: process.env.MYMEMORY_EMAIL || undefined }),
 });
 
 serve({ fetch: app.fetch, port: Number(process.env.PORT ?? 3000) }, ({ port }) => {

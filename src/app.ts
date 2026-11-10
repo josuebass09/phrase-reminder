@@ -10,6 +10,7 @@ import {
   createUser,
   deletePhrase,
   findUser,
+  findPhraseTranslation,
   findUserByEmail,
   finishInvite,
   isInviteUsable,
@@ -19,6 +20,7 @@ import {
   MAX_PHRASE_LENGTH,
   normalizeEmail,
   saveSubscription,
+  saveTranslation,
   updatePhrase,
   type Db,
   type DeviceSubscription,
@@ -26,6 +28,7 @@ import {
 } from './db.js';
 import { hashInviteCode, INVITE_LIFETIME_DAYS, newInviteCode } from './invites.js';
 import { checkNewPassword, dummyHash, hashPassword, MAX_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
+import type { Translator } from './translate.js';
 
 export interface AppConfig {
   db: Db;
@@ -34,6 +37,8 @@ export interface AppConfig {
   vapidPublicKey: string;
   /** Origins of the separate app allowed to call /api, such as https://app.up.railway.app. */
   appOrigins?: string[];
+  /** Translates phrases to Spanish. Without it, asking for a translation gets a 503. */
+  translate?: Translator;
 }
 
 type AppEnv = { Variables: { user: User } };
@@ -80,7 +85,7 @@ const WRONG_LOGIN = { error: 'Wrong email or password' };
 const UNUSABLE_INVITE = { error: 'This invite is not valid, was already used, or has expired' };
 const EMAIL_TAKEN = { error: 'An account with that email already exists' };
 
-export function createApp({ db, tokenSecret, vapidPublicKey, appOrigins = [] }: AppConfig): Hono<AppEnv> {
+export function createApp({ db, tokenSecret, vapidPublicKey, appOrigins = [], translate }: AppConfig): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
 
   /** The body for a new session, the same after logging in and after signing up. */
@@ -215,6 +220,26 @@ export function createApp({ db, tokenSecret, vapidPublicKey, appOrigins = [] }: 
     if (id === null || !(await deletePhrase(db, c.get('user').id, id))) return c.json(NOT_FOUND, 404);
 
     return c.body(null, 204);
+  });
+
+  // Translated on the first request, then served from the database.
+  app.get('/api/phrases/:id/translation', requireUser, async (c) => {
+    const userId = c.get('user').id;
+    const id = parsePhraseId(c.req.param('id'));
+    const phrase = id === null ? null : await findPhraseTranslation(db, userId, id);
+    if (id === null || !phrase) return c.json(NOT_FOUND, 404);
+    if (phrase.translation) return c.json({ translation: phrase.translation });
+    if (!translate) return c.json({ error: "Translation isn't available" }, 503);
+
+    let translation: string;
+    try {
+      translation = await translate(phrase.text);
+    } catch (error) {
+      console.error('Translation failed:', error);
+      return c.json({ error: "Couldn't translate right now" }, 502);
+    }
+    await saveTranslation(db, userId, id, phrase.text, translation);
+    return c.json({ translation });
   });
 
   app.post('/api/push/subscribe', requireUser, async (c) => {

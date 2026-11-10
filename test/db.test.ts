@@ -9,6 +9,7 @@ import {
   deletePhrase,
   deleteSubscription,
   ensureSchema,
+  findPhraseTranslation,
   findUser,
   findUserByEmail,
   finishInvite,
@@ -23,6 +24,7 @@ import {
   markShown,
   pickDailyPhrases,
   saveSubscription,
+  saveTranslation,
   setPasswordHash,
   updatePhrase,
   type Db,
@@ -286,6 +288,24 @@ describe('updatePhrase', () => {
     await updatePhrase(db, alice.id, phrase.id, 'It slipped my mind.');
 
     expect((await listToday(db, alice.id)).map((p) => p.text)).toEqual(['It slipped my mind.']);
+  });
+
+  it('drops the saved translation when the text changes, and keeps it when it does not', async () => {
+    const phrase = await addPhrase(db, alice.id, 'Hello.');
+    await saveTranslation(db, alice.id, phrase.id, 'Hello.', 'Hola.');
+
+    await updatePhrase(db, alice.id, phrase.id, 'Hello.');
+    expect((await findPhraseTranslation(db, alice.id, phrase.id))?.translation).toBe('Hola.');
+    await updatePhrase(db, alice.id, phrase.id, 'Hello there.');
+    expect(await findPhraseTranslation(db, alice.id, phrase.id)).toEqual({ text: 'Hello there.', translation: null });
+  });
+
+  it('saves no translation for text that changed while it was being translated', async () => {
+    const phrase = await addPhrase(db, alice.id, 'Hello there.');
+
+    await saveTranslation(db, alice.id, phrase.id, 'Hello.', 'Hola.');
+
+    expect((await findPhraseTranslation(db, alice.id, phrase.id))?.translation).toBeNull();
   });
 
   it("leaves another user's phrase alone", async () => {
