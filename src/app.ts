@@ -14,6 +14,9 @@ import {
   findUserByEmail,
   finishInvite,
   getSettings,
+  releaseTranslation,
+  reserveTranslation,
+  translationsUsed,
   isInviteUsable,
   isValidEmail,
   listRecent,
@@ -31,7 +34,7 @@ import {
 } from './db.js';
 import { hashInviteCode, INVITE_LIFETIME_DAYS, newInviteCode } from './invites.js';
 import { checkNewPassword, dummyHash, hashPassword, MAX_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
-import { isValidTime, isValidTimeZone, MAX_PHRASES_PER_DAY } from './schedule.js';
+import { isValidTime, isValidTimeZone, localClock, MAX_PHRASES_PER_DAY } from './schedule.js';
 import type { Translator } from './translate.js';
 
 export interface AppConfig {
@@ -43,7 +46,14 @@ export interface AppConfig {
   appOrigins?: string[];
   /** Translates phrases to Spanish. Without it, asking for a translation gets a 503. */
   translate?: Translator;
+  /** New translations each user may ask for per local day. The admin has no limit. */
+  translationsPerDay?: number;
 }
+
+export const DEFAULT_TRANSLATIONS_PER_DAY = 30;
+
+/** Big enough to never stop anyone, for the admin, whose translations are still counted. */
+const NO_LIMIT = 2_147_483_647;
 
 type AppEnv = { Variables: { user: User } };
 
@@ -120,8 +130,21 @@ const WRONG_LOGIN = { error: 'Wrong email or password' };
 const UNUSABLE_INVITE = { error: 'This invite is not valid, was already used, or has expired' };
 const EMAIL_TAKEN = { error: 'An account with that email already exists' };
 
-export function createApp({ db, tokenSecret, vapidPublicKey, appOrigins = [], translate }: AppConfig): Hono<AppEnv> {
+export function createApp({
+  db,
+  tokenSecret,
+  vapidPublicKey,
+  appOrigins = [],
+  translate,
+  translationsPerDay = DEFAULT_TRANSLATIONS_PER_DAY,
+}: AppConfig): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
+
+  /** The user's local day, from the time zone in their settings, for daily limits. */
+  async function userDay(userId: number): Promise<string> {
+    const settings = await getSettings(db, userId);
+    return localClock(new Date(), settings?.timeZone ?? 'UTC').day;
+  }
 
   /** The body for a new session, the same after logging in and after signing up. */
   async function sessionFor(user: User) {
@@ -227,6 +250,13 @@ export function createApp({ db, tokenSecret, vapidPublicKey, appOrigins = [], tr
 
   app.get('/api/me', requireUser, (c) => c.json(c.get('user')));
 
+  // How many new translations the user has used today, and their limit (null for the admin).
+  app.get('/api/translation-usage', requireUser, async (c) => {
+    const user = c.get('user');
+    const used = await translationsUsed(db, user.id, await userDay(user.id));
+    return c.json({ used, limit: user.isAdmin ? null : translationsPerDay });
+  });
+
   app.get('/api/settings', requireUser, async (c) => c.json(await getSettings(db, c.get('user').id)));
 
   // Changes only the settings sent; the others stay as they are.
@@ -275,10 +305,19 @@ export function createApp({ db, tokenSecret, vapidPublicKey, appOrigins = [], tr
     if (phrase.translation) return c.json({ translation: phrase.translation });
     if (!translate) return c.json({ error: "Translation isn't available" }, 503);
 
+    // Only new translations count toward the daily limit; saved ones above are free.
+    const user = c.get('user');
+    const day = await userDay(userId);
+    const limit = user.isAdmin ? NO_LIMIT : translationsPerDay;
+    if (!(await reserveTranslation(db, userId, day, limit))) {
+      return c.json({ error: `You've used today's ${translationsPerDay} translations. More tomorrow.` }, 429);
+    }
+
     let translation: string;
     try {
       translation = await translate(phrase.text);
     } catch (error) {
+      await releaseTranslation(db, userId, day);
       console.error('Translation failed:', error);
       return c.json({ error: "Couldn't translate right now" }, 502);
     }

@@ -98,6 +98,9 @@ export async function ensureSchema(db: Db): Promise<void> {
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phrases_per_day INTEGER NOT NULL DEFAULT ${DEFAULT_SETTINGS.phrasesPerDay}`);
   // The user's local day of the last reminder sent, so each day gets one.
   await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_reminder_day TEXT');
+  // New translations used on the user's local day, for the daily limit.
+  await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS translations_day TEXT');
+  await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS translations_used INTEGER NOT NULL DEFAULT 0');
   // Only a hash of each code is kept, so reading the table doesn't give working invites.
   await db.query(`
     CREATE TABLE IF NOT EXISTS invites (
@@ -280,6 +283,39 @@ export async function listReminderCandidates(db: Db): Promise<ReminderCandidate[
     ORDER BY id
   `);
   return rows;
+}
+
+/**
+ * Counts one new translation for the user on their local day, unless that would
+ * pass the limit. Returns false if they've reached it. A new day starts the count over.
+ */
+export async function reserveTranslation(db: Db, userId: number, day: string, limit: number): Promise<boolean> {
+  const { rows } = await db.query(
+    `UPDATE users
+     SET translations_used = CASE WHEN translations_day = $2 THEN translations_used + 1 ELSE 1 END,
+         translations_day = $2
+     WHERE id = $1 AND (translations_day IS DISTINCT FROM $2 OR translations_used < $3)
+     RETURNING id`,
+    [userId, day, limit],
+  );
+  return rows.length > 0;
+}
+
+/** Gives back a reserved translation that didn't happen, such as when the service failed. */
+export async function releaseTranslation(db: Db, userId: number, day: string): Promise<void> {
+  await db.query(
+    'UPDATE users SET translations_used = GREATEST(translations_used - 1, 0) WHERE id = $1 AND translations_day = $2',
+    [userId, day],
+  );
+}
+
+/** New translations the user has used on their local day. */
+export async function translationsUsed(db: Db, userId: number, day: string): Promise<number> {
+  const { rows } = await db.query(
+    'SELECT CASE WHEN translations_day = $2 THEN translations_used ELSE 0 END AS used FROM users WHERE id = $1',
+    [userId, day],
+  );
+  return rows[0]?.used ?? 0;
 }
 
 export async function setLastReminderDay(db: Db, userId: number, day: string): Promise<void> {

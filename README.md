@@ -92,7 +92,8 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `POST /api/phrases` with `{ text }` | Yes | The saved phrase, 201 |
 | `PATCH /api/phrases/:id` with `{ text }` | Yes | The updated phrase, or 404 |
 | `DELETE /api/phrases/:id` | Yes | 204, or 404 |
-| `GET /api/phrases/:id/translation` | Yes | `{ translation }` in Spanish, or 404. 502 if the translation service fails |
+| `GET /api/phrases/:id/translation` | Yes | `{ translation }` in Spanish, or 404. 429 once the user's new translations for the day are used up, and 502 if the translation service fails |
+| `GET /api/translation-usage` | Yes | `{ used, limit }`: new translations today, and the daily limit (`null` for the admin) |
 | `POST /api/push/subscribe` with a `PushSubscription` | Yes | 204 |
 
 Send the token as `Authorization: Bearer <token>`. It's a JWT signed with `SESSION_SECRET`, and `expiresIn` is its lifetime in seconds (43200). Without a valid token, these requests get a 401. Phrases look like `{ id, text, createdAt }`. Another user's phrase gets the same 404 as a missing one.
@@ -101,7 +102,9 @@ Send the token as `Authorization: Bearer <token>`. It's a JWT signed with `SESSI
 
 The app can show each phrase in Spanish. The backend asks [MyMemory](https://mymemory.translated.net/), a free translation API that needs no key or account, the first time someone asks for a phrase, and saves the result with the phrase. Later requests come from the database, and editing the phrase's text drops the saved translation.
 
-MyMemory's free limit is about 5,000 characters a day per server. Set `MYMEMORY_EMAIL` on the web service to a contact email to raise it to about 50,000. Since each phrase is translated once, either is usually plenty. When the limit runs out, the app says it couldn't translate, and the phrase can be translated the next day.
+MyMemory's free limit is about 5,000 characters a day per server. Set `MYMEMORY_EMAIL` on the web service to a contact email to raise it to about 50,000. When the limit runs out, the app says it couldn't translate, and the phrase can be translated the next day.
+
+So one person can't use up that shared limit, each user may ask for 30 new translations a day, counted on their local day from their settings' time zone. Opening a saved translation doesn't count, a failed translation is given back, and the admin has no limit (their translations are still counted). Set `TRANSLATIONS_PER_DAY` on the web service to change the 30. With 20 users of about 55-character phrases, 30 each comes to at most about 33,000 characters a day, within the 50,000 with room to spare. Settings in the app shows each user how many they've used today.
 
 ## Import your current file
 

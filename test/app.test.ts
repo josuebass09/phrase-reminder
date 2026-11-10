@@ -403,6 +403,73 @@ describe('GET /api/phrases/:id/translation', () => {
     expect(await retried.json()).toEqual({ translation: 'Hola.' });
   });
 
+  describe('daily limit', () => {
+    const limited = (translate = vi.fn(async (text: string) => `es: ${text}`)) =>
+      createApp({ db, tokenSecret: SECRET, vapidPublicKey: 'k', translate, translationsPerDay: 2 });
+    const usage = async (target: ReturnType<typeof createApp>, user: User) =>
+      (await target.request('/api/translation-usage', { headers: { Authorization: await bearer(user) } })).json();
+
+    it('allows each user that many new translations a day, then answers 429', async () => {
+      const target = limited();
+      const [one, two, three] = [await addPhrase(db, bob.id, 'one'), await addPhrase(db, bob.id, 'two'), await addPhrase(db, bob.id, 'three')];
+
+      const statuses = [(await ask(target, bob, one.id)).status, (await ask(target, bob, two.id)).status];
+      const third = await ask(target, bob, three.id);
+
+      expect(statuses).toEqual([200, 200]);
+      expect(third.status).toBe(429);
+      expect(await third.json()).toEqual({ error: "You've used today's 2 translations. More tomorrow." });
+      expect(await usage(target, bob)).toEqual({ used: 2, limit: 2 });
+    });
+
+    it('keeps serving saved translations once the limit is reached', async () => {
+      const target = limited();
+      const one = await addPhrase(db, bob.id, 'one');
+      await ask(target, bob, one.id);
+      await ask(target, bob, (await addPhrase(db, bob.id, 'two')).id);
+
+      const again = await ask(target, bob, one.id);
+
+      expect(again.status).toBe(200);
+      expect(await again.json()).toEqual({ translation: 'es: one' });
+    });
+
+    it('does not count a translation that failed', async () => {
+      const translate = vi.fn().mockRejectedValueOnce(new Error('down')).mockResolvedValue('uno');
+      const target = limited(translate);
+      const one = await addPhrase(db, bob.id, 'one');
+      const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      await ask(target, bob, one.id);
+      quiet.mockRestore();
+
+      expect(await usage(target, bob)).toEqual({ used: 0, limit: 2 });
+    });
+
+    it('starts over on the user\'s next day', async () => {
+      const target = limited();
+      await ask(target, bob, (await addPhrase(db, bob.id, 'one')).id);
+      await ask(target, bob, (await addPhrase(db, bob.id, 'two')).id);
+      await db.query("UPDATE users SET translations_day = '2000-01-01' WHERE id = $1", [bob.id]); // As if that was yesterday.
+
+      expect((await ask(target, bob, (await addPhrase(db, bob.id, 'three')).id)).status).toBe(200);
+      expect(await usage(target, bob)).toEqual({ used: 1, limit: 2 });
+    });
+
+    it('does not limit the admin, but still counts', async () => {
+      const target = limited();
+      for (const text of ['one', 'two', 'three']) {
+        expect((await ask(target, alice, (await addPhrase(db, alice.id, text)).id)).status).toBe(200);
+      }
+
+      expect(await usage(target, alice)).toEqual({ used: 3, limit: null });
+    });
+
+    it('defaults to 30 a day', async () => {
+      expect(await usage(appWith(async () => 'x'), bob)).toEqual({ used: 0, limit: 30 });
+    });
+  });
+
   it('answers 503 when no translator is set up', async () => {
     const phrase = await addPhrase(db, alice.id, 'Hello.');
 

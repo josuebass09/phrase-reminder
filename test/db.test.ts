@@ -23,9 +23,12 @@ import {
   listUsers,
   markShown,
   pickDailyPhrases,
+  releaseTranslation,
+  reserveTranslation,
   saveSubscription,
   saveTranslation,
   setPasswordHash,
+  translationsUsed,
   updatePhrase,
   type Db,
   type User,
@@ -159,6 +162,33 @@ describe('invites', () => {
     await db.query('DELETE FROM users WHERE id = $1', [alice.id]);
 
     expect(await isInviteUsable(db, 'hash-1')).toBe(false);
+  });
+});
+
+describe('translation limits', () => {
+  it('count up to the limit, per user and day', async () => {
+    expect(await reserveTranslation(db, bob.id, '2026-11-10', 2)).toBe(true);
+    expect(await reserveTranslation(db, bob.id, '2026-11-10', 2)).toBe(true);
+    expect(await reserveTranslation(db, bob.id, '2026-11-10', 2)).toBe(false);
+    expect(await translationsUsed(db, bob.id, '2026-11-10')).toBe(2);
+    expect(await translationsUsed(db, alice.id, '2026-11-10')).toBe(0);
+  });
+
+  it('start over on a new day', async () => {
+    await reserveTranslation(db, bob.id, '2026-11-10', 1);
+
+    expect(await reserveTranslation(db, bob.id, '2026-11-11', 1)).toBe(true);
+    expect(await translationsUsed(db, bob.id, '2026-11-11')).toBe(1);
+    expect(await translationsUsed(db, bob.id, '2026-11-12')).toBe(0);
+  });
+
+  it('give back a translation that did not happen', async () => {
+    await reserveTranslation(db, bob.id, '2026-11-10', 1);
+
+    await releaseTranslation(db, bob.id, '2026-11-10');
+
+    expect(await translationsUsed(db, bob.id, '2026-11-10')).toBe(0);
+    expect(await reserveTranslation(db, bob.id, '2026-11-10', 1)).toBe(true);
   });
 });
 
