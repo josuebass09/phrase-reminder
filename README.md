@@ -31,7 +31,7 @@ Railway deploys from this repository, so push it to GitHub first. All settings b
 3. Add a **web service** from this repository:
    - Build command: `npm run build`
    - Start command: `npm start`
-   - Variables: `DATABASE_URL` (reference the Postgres service), `APP_PASSWORD`, `SESSION_SECRET`, `VAPID_PUBLIC_KEY`
+   - Variables: `DATABASE_URL` (reference the Postgres service), `APP_PASSWORD`, `SESSION_SECRET`, `VAPID_PUBLIC_KEY`, and `APP_ORIGIN` once the app has a domain
    - Generate a public domain under Networking.
 4. Add a **cron service** from the same repository:
    - Build command: `npm run build`
@@ -44,6 +44,23 @@ Generate `APP_PASSWORD` and `SESSION_SECRET` with `openssl rand -base64 32`. Set
 ### The schedule
 
 Railway cron schedules run in UTC. Costa Rica is UTC-6 all year, so `0 18 * * *` means 12:00 there. If you change the time, also change the `12:00` labels in `public/app.js`.
+
+## API for the app
+
+The app lives in its own repository and domain. Two `*.up.railway.app` domains count as different sites, so browsers don't send this server's session cookie to it, and the app uses a bearer token instead. Set `APP_ORIGIN` to the app's URL so the browser lets it call the API.
+
+| Request | Session | Response |
+|---|---|---|
+| `GET /api/config` | No | `{ vapidPublicKey }` |
+| `POST /api/login` with `{ password }` | No | `{ token }`, valid for a year, or 401 |
+| `GET /api/phrases` | Yes | The 50 newest phrases |
+| `GET /api/today` | Yes | The phrases from the latest reminder |
+| `POST /api/phrases` with `{ text }` | Yes | The saved phrase, 201 |
+| `PATCH /api/phrases/:id` with `{ text }` | Yes | The updated phrase, or 404 |
+| `DELETE /api/phrases/:id` | Yes | 204, or 404 |
+| `POST /api/push/subscribe` with a `PushSubscription` | Yes | 204 |
+
+Send the token as `Authorization: Bearer <token>`. Phrases look like `{ id, text, createdAt }`. Changing `SESSION_SECRET` invalidates every token.
 
 ## Import your current file
 

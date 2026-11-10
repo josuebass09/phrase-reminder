@@ -11,6 +11,11 @@ const app = createApp({
   password: requireEnv('APP_PASSWORD'),
   sessionSecret: requireEnv('SESSION_SECRET'),
   vapidPublicKey: requireEnv('VAPID_PUBLIC_KEY'),
+  // Optional, comma-separated. Without it, no other site can call the API.
+  appOrigins: (process.env.APP_ORIGIN ?? '')
+    .split(',')
+    .map((origin) => origin.trim().replace(/\/+$/, ''))
+    .filter(Boolean),
 });
 
 serve({ fetch: app.fetch, port: Number(process.env.PORT ?? 3000) }, ({ port }) => {

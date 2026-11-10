@@ -2,7 +2,9 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { Hono, type Context } from 'hono';
 import { getSignedCookie, setSignedCookie } from 'hono/cookie';
+import { cors } from 'hono/cors';
 import { secureHeaders } from 'hono/secure-headers';
+import { createToken, verifyToken } from './auth.js';
 import {
   addPhrase,
   deletePhrase,
@@ -25,6 +27,8 @@ export interface AppConfig {
   password: string;
   sessionSecret: string;
   vapidPublicKey: string;
+  /** Origins of the separate app allowed to call /api, such as https://app.up.railway.app. */
+  appOrigins?: string[];
 }
 
 /** Reads a browser's PushSubscription JSON. Push endpoints must be HTTPS. */
@@ -71,11 +75,36 @@ function platformOf(c: Context): Platform {
   return /android/i.test(c.req.header('user-agent') ?? '') ? 'android' : 'ios';
 }
 
-export function createApp({ db, password, sessionSecret, vapidPublicKey }: AppConfig): Hono {
+export function createApp({
+  db,
+  password,
+  sessionSecret,
+  vapidPublicKey,
+  appOrigins = [],
+}: AppConfig): Hono {
   const app = new Hono();
 
-  const isLoggedIn = async (c: Context) =>
-    (await getSignedCookie(c, sessionSecret, SESSION_COOKIE)) === SESSION_VALUE;
+  // The separate app sends a bearer token; the pages served here use the cookie.
+  // A request with an Authorization header is judged on the token alone.
+  const isLoggedIn = async (c: Context) => {
+    const authorization = c.req.header('authorization');
+    if (authorization !== undefined) {
+      return authorization.startsWith('Bearer ') && verifyToken(sessionSecret, authorization.slice(7));
+    }
+    return (await getSignedCookie(c, sessionSecret, SESSION_COOKIE)) === SESSION_VALUE;
+  };
+
+  if (appOrigins.length > 0) {
+    app.use(
+      '/api/*',
+      cors({
+        origin: appOrigins,
+        allowMethods: ['GET', 'POST', 'PATCH', 'DELETE'],
+        allowHeaders: ['Authorization', 'Content-Type'],
+        maxAge: 86_400,
+      }),
+    );
+  }
 
   app.use(
     secureHeaders({
@@ -117,6 +146,21 @@ export function createApp({ db, password, sessionSecret, vapidPublicKey }: AppCo
         vapidPublicKey,
       }),
     );
+  });
+
+  // The push key is public by design; the app needs it before anyone logs in.
+  app.get('/api/config', (c) => c.json({ vapidPublicKey }));
+
+  app.post('/api/login', async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const given = typeof body?.password === 'string' ? body.password : '';
+    if (!samePassword(given, password)) return c.json({ error: 'Wrong password' }, 401);
+    return c.json({ token: createToken(sessionSecret) });
+  });
+
+  app.get('/api/phrases', async (c) => {
+    if (!(await isLoggedIn(c))) return c.json({ error: 'Not logged in' }, 401);
+    return c.json(await listRecent(db));
   });
 
   app.get('/api/today', async (c) => {

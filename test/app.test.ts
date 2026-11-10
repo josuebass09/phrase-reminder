@@ -332,3 +332,127 @@ describe('GET /', () => {
     expect(response.headers.get('content-security-policy')).toContain("default-src 'self'");
   });
 });
+
+function requestToken(body: string) {
+  return app.request('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+  });
+}
+
+async function bearer(): Promise<string> {
+  const { token } = await (await requestToken(JSON.stringify({ password: PASSWORD }))).json();
+  return `Bearer ${token}`;
+}
+
+describe('POST /api/login', () => {
+  it('returns a token that authorizes API requests', async () => {
+    const response = await requestToken(JSON.stringify({ password: PASSWORD }));
+    const { token } = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(token).toEqual(expect.any(String));
+    const phrases = await app.request('/api/phrases', { headers: { Authorization: `Bearer ${token}` } });
+    expect(phrases.status).toBe(200);
+  });
+
+  it.each([
+    ['a wrong password', JSON.stringify({ password: 'wrong' })],
+    ['a missing password', JSON.stringify({})],
+    ['invalid JSON', 'not json'],
+  ])('rejects %s without a token', async (_name, body) => {
+    const response = await requestToken(body);
+
+    expect(response.status).toBe(401);
+    expect(await response.json()).not.toHaveProperty('token');
+  });
+
+  it('lets a token save, edit, and delete phrases', async () => {
+    const authorization = await bearer();
+    const headers = { Authorization: authorization, 'Content-Type': 'application/json' };
+
+    const created = await app.request('/api/phrases', { method: 'POST', headers, body: JSON.stringify({ text: 'Hi' }) });
+    const { id } = await created.json();
+    const edited = await app.request(`/api/phrases/${id}`, { method: 'PATCH', headers, body: JSON.stringify({ text: 'Hello' }) });
+    const deleted = await app.request(`/api/phrases/${id}`, { method: 'DELETE', headers });
+
+    expect([created.status, edited.status, deleted.status]).toEqual([201, 200, 204]);
+  });
+
+  it('judges a request with an Authorization header on the token alone', async () => {
+    const response = await app.request('/api/phrases', {
+      headers: { Authorization: 'Bearer forged', Cookie: await logIn() },
+    });
+
+    expect(response.status).toBe(401);
+  });
+});
+
+describe('GET /api/phrases', () => {
+  it('rejects requests without a session', async () => {
+    const response = await app.request('/api/phrases');
+
+    expect(response.status).toBe(401);
+  });
+
+  it('returns recent phrases, newest first', async () => {
+    await insertAged(db, 'older', 2);
+    await insertAged(db, 'newer', 1);
+
+    const response = await app.request('/api/phrases', { headers: { Authorization: await bearer() } });
+    const phrases = await response.json();
+
+    expect(phrases.map((p: { text: string }) => p.text)).toEqual(['newer', 'older']);
+    expect(phrases[0]).toEqual({ id: expect.any(Number), text: 'newer', createdAt: expect.any(String) });
+  });
+});
+
+describe('GET /api/config', () => {
+  it('gives the public push key without a session', async () => {
+    const response = await app.request('/api/config');
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ vapidPublicKey: 'test-public-key' });
+  });
+});
+
+describe('CORS', () => {
+  const APP_ORIGIN = 'https://app.example';
+
+  function preflight(target: ReturnType<typeof createApp>, origin: string) {
+    return target.request('/api/phrases', {
+      method: 'OPTIONS',
+      headers: {
+        Origin: origin,
+        'Access-Control-Request-Method': 'PATCH',
+        'Access-Control-Request-Headers': 'authorization,content-type',
+      },
+    });
+  }
+
+  function appWithOrigins(appOrigins?: string[]) {
+    return createApp({ db, password: PASSWORD, sessionSecret: 'test-secret', vapidPublicKey: 'k', appOrigins });
+  }
+
+  it('lets the configured app origin call the API', async () => {
+    const response = await preflight(appWithOrigins([APP_ORIGIN]), APP_ORIGIN);
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get('access-control-allow-origin')).toBe(APP_ORIGIN);
+    expect(response.headers.get('access-control-allow-headers')?.toLowerCase()).toContain('authorization');
+    expect(response.headers.get('access-control-allow-methods')).toContain('PATCH');
+  });
+
+  it('does not allow other origins', async () => {
+    const response = await preflight(appWithOrigins([APP_ORIGIN]), 'https://evil.example');
+
+    expect(response.headers.get('access-control-allow-origin')).toBeNull();
+  });
+
+  it('allows no origin when none is configured', async () => {
+    const response = await preflight(appWithOrigins(), APP_ORIGIN);
+
+    expect(response.headers.get('access-control-allow-origin')).toBeNull();
+  });
+});
