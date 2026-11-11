@@ -174,7 +174,7 @@ describe('npm run users -- stats', () => {
     return rows[0];
   }
 
-  it("shows each user's weeks: reminder days sent and opened, days with Today, and phrases practiced", async () => {
+  it("shows each user's weeks: reminder days sent and opened, days with Today, phrases practiced, and remembered", async () => {
     const user = await insertUser(db, 'me@example.com');
     const { day, week } = await daysAgo(0);
     await recordActivity(db, user.id, day, 'reminder_sent');
@@ -183,11 +183,13 @@ describe('npm run users -- stats', () => {
     await recordActivity(db, user.id, day, 'phrase_heard', 1);
     await recordActivity(db, user.id, day, 'phrase_translated', 1);
     await recordActivity(db, user.id, day, 'phrase_scored', 2);
+    await recordActivity(db, user.id, day, 'phrase_remembered', 3);
+    await recordActivity(db, user.id, day, 'phrase_read', 4);
 
     await run(['stats']);
 
     expect(lines).toEqual([
-      `me@example.com\tweek of ${week}\t1 reminders\t1 opened\t1 days with Today\t2 phrases practiced`,
+      `me@example.com\tweek of ${week}\t1 reminders\t1 opened\t1 days with Today\t4 phrases practiced\t1 remembered`,
     ]);
   });
 

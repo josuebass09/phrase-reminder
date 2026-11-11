@@ -105,6 +105,8 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `POST /api/phrases/:id/pronunciation` with a recording as the body, and its type, such as `audio/webm`, as `Content-Type` | Yes | `{ score, words, heard, tip }`: the score from 1 to 10, the phrase's words as `{ text, ok }`, what was heard, and a tip in the user's language. The score is saved as the phrase's `lastScore`. 400 for a body that isn't audio Groq reads, 413 over 1 MB, 422 if nobody spoke, 429 once the user's scores for the day are used up, 502 if Groq fails, 503 without `GROQ_API_KEY` |
 | `GET /api/usage` | Yes | `{ translations, suggestions, pronunciations }`, each `{ used, limit }`: what the user has used today, and the daily limit (`null` for the admin) |
 | `POST /api/activity` with `{ kind }`, and `phraseId` for a phrase kind | Yes | 204, once recorded (see Activity). 400 for an unknown kind, or a phrase with a kind that has none, and 404 for a phrase that isn't the user's |
+| `POST /api/phrases/:id/review` with `{ as }`, `read` or `remembered` | Yes | 204: takes the phrase off Today until a later reminder sends it again, and records the answer (see Activity). Answering again the same day replaces it. 400 for another `as`, 404 for a phrase that isn't the user's |
+| `DELETE /api/phrases/:id/review` | Yes | 204: undoes it, putting the phrase back on Today and forgetting today's answer |
 | `POST /api/push/subscribe` with a `PushSubscription` | Yes | 204 |
 | `GET /api/admin/ai` | Admin | Each AI service's requests on each of the last 30 UTC days, what Groq last said is left of its daily quotas, MyMemory's daily characters, and the users' limits (see Admin). 403 for other users |
 | `GET /api/admin/users` | Admin | Every user with their sign-up date, last activity, phrases, devices, open sessions, reminders on or off, and what they used today |
@@ -145,9 +147,9 @@ The score is saved with the phrase, and editing the text drops it. The recording
 
 To tell whether the reminders help, as `docs/ideas/phrase-reminder.md` asks, the backend records what each user did on each of their local days: that a reminder reached a device, and that the user opened the app from it, looked at Today, or heard, translated, or said aloud a phrase. Each counts once a day, or once a day per phrase, however often it happens, so the table stays small. It keeps the day and the phrase's id, never its text or a recording, and it goes when the user's account does.
 
-The backend records reminders sent and phrases said aloud itself. The app reports the rest with `POST /api/activity`, where `kind` is `reminder_opened` or `today_viewed`, or `phrase_heard` or `phrase_translated` with the phrase's id.
+The backend records reminders sent, phrases said aloud, and phrases swiped off Today as read or remembered itself. The app reports the rest with `POST /api/activity`, where `kind` is `reminder_opened` or `today_viewed`, or `phrase_heard` or `phrase_translated` with the phrase's id.
 
-`npm run users -- stats` shows each user's last 4 weeks, from Monday, one line a week: the days a reminder reached a device, the days the user opened the app from it, the days they looked at Today, and how many different phrases they practiced. Add a number for more weeks, up to 52, such as `npm run users -- stats 12`. The notification shows the phrases themselves, so someone can read them without opening the app: the days opened are the least they read, not all of it.
+`npm run users -- stats` shows each user's last 4 weeks, from Monday, one line a week: the days a reminder reached a device, the days the user opened the app from it, the days they looked at Today, how many different phrases they practiced, and how many of those they remembered rather than just read, which tells whether reading is enough to remember. Add a number for more weeks, up to 52, such as `npm run users -- stats 12`. The notification shows the phrases themselves, so someone can read them without opening the app: the days opened are the least they read, not all of it.
 
 ## Admin
 

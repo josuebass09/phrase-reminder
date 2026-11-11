@@ -2,6 +2,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   aiQuotas,
+  markReviewed,
   cronRunsSince,
   recordCronRun,
   aiUsageSince,
@@ -279,6 +280,17 @@ describe('listToday', () => {
 
     expect((await listToday(db, alice.id)).map((p) => p.text)).toEqual(["alice's"]);
     expect((await listToday(db, bob.id)).map((p) => p.text)).toEqual(["bob's"]);
+  });
+
+  it('leaves out a phrase reviewed since it was sent', async () => {
+    await insertAged(db, alice.id, 'first', 20);
+    await insertAged(db, alice.id, 'second', 20);
+    const sent = await listRecent(db, alice.id);
+    await markShown(db, sent.map((p) => p.id));
+
+    await markReviewed(db, alice.id, sent.find((p) => p.text === 'first')!.id, true);
+
+    expect((await listToday(db, alice.id)).map((p) => p.text)).toEqual(['second']);
   });
 
   it('returns nothing when the latest batch is over 24 hours old', async () => {

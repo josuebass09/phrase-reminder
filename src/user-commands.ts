@@ -57,6 +57,7 @@ export async function runUsersCommand(db: Db, args: string[], io: CommandIO): Pr
           `${row.remindersOpened} opened`,
           `${row.todayViewed} days with Today`,
           `${row.phrasesPracticed} phrases practiced`,
+          `${row.phrasesRemembered} remembered`,
         ].join('\t'),
       );
     }

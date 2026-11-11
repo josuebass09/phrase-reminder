@@ -557,6 +557,76 @@ describe('GET /api/today', () => {
   });
 });
 
+describe('/api/phrases/:id/review', () => {
+  async function sendPhrase(user: User, text: string) {
+    await insertAged(db, user.id, text, 20);
+    const [phrase] = await listRecent(db, user.id, { limit: 1 });
+    await markShown(db, [phrase.id]);
+    return phrase.id;
+  }
+  const review = (user: User, id: number, as: unknown) =>
+    requestAs(user, `/api/phrases/${id}/review`, { method: 'POST', body: JSON.stringify({ as }) });
+  const todayOf = async (user: User) => textOf(await (await requestAs(user, '/api/today')).json());
+  const answers = async (id: number) =>
+    (await db.query('SELECT kind FROM activity WHERE phrase_id = $1 ORDER BY kind', [id])).rows.map((row) => row.kind);
+
+  it("takes a phrase off Today once it's reviewed, keeping whether it was read or remembered", async () => {
+    const id = await sendPhrase(alice, 'It slipped my mind.');
+    await sendPhrase(alice, 'Keep me posted.');
+
+    expect((await review(alice, id, 'remembered')).status).toBe(204);
+
+    expect(await todayOf(alice)).toEqual(['Keep me posted.']);
+    expect(await answers(id)).toEqual(['phrase_remembered']);
+    expect(textOf(await listRecent(db, alice.id))).toContain('It slipped my mind.'); // Only off Today.
+  });
+
+  it('keeps one answer a day per phrase: the latest', async () => {
+    const id = await sendPhrase(alice, 'It slipped my mind.');
+
+    await review(alice, id, 'remembered');
+    await review(alice, id, 'read');
+
+    expect(await answers(id)).toEqual(['phrase_read']);
+  });
+
+  it('puts the phrase back on Today, and forgets the answer, when undone', async () => {
+    const id = await sendPhrase(alice, 'It slipped my mind.');
+    await review(alice, id, 'read');
+
+    const response = await requestAs(alice, `/api/phrases/${id}/review`, { method: 'DELETE' });
+
+    expect(response.status).toBe(204);
+    expect(await todayOf(alice)).toEqual(['It slipped my mind.']);
+    expect(await answers(id)).toEqual([]);
+  });
+
+  it('brings a reviewed phrase back when a later reminder sends it again', async () => {
+    const id = await sendPhrase(alice, 'It slipped my mind.');
+    await review(alice, id, 'remembered');
+    await db.query("UPDATE phrases SET reviewed_at = now() - interval '1 day'"); // Reviewed yesterday.
+
+    await markShown(db, [id]);
+
+    expect(await todayOf(alice)).toEqual(['It slipped my mind.']);
+  });
+
+  it.each(['seen', 'constructor', undefined])('refuses %s as an answer', async (as) => {
+    const id = await sendPhrase(alice, 'It slipped my mind.');
+
+    expect((await review(alice, id, as)).status).toBe(400);
+    expect(await todayOf(alice)).toEqual(['It slipped my mind.']);
+  });
+
+  it("answers 404 for another user's phrase, both ways", async () => {
+    const id = await sendPhrase(bob, "Bob's phrase.");
+
+    expect((await review(alice, id, 'read')).status).toBe(404);
+    expect((await requestAs(alice, `/api/phrases/${id}/review`, { method: 'DELETE' })).status).toBe(404);
+    expect(await todayOf(bob)).toEqual(["Bob's phrase."]);
+  });
+});
+
 describe('GET /api/phrases/:id/translation', () => {
   function appWith(translate?: (text: string) => Promise<string>) {
     return createApp({ db, tokenSecret: SECRET, vapidPublicKey: 'k', translate });

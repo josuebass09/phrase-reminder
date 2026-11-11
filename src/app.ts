@@ -32,6 +32,7 @@ import {
   findUserInSession,
   findPhraseTranslation,
   findUserByEmail,
+  forgetActivity,
   finishInvite,
   getSettings,
   isInviteUsable,
@@ -39,6 +40,7 @@ import {
   listRecent,
   listToday,
   listUsersForAdmin,
+  markReviewed,
   recordActivity,
   MAX_PHRASE_LENGTH,
   MAX_TRANSLATION_LENGTH,
@@ -122,6 +124,8 @@ type AppEnv = { Variables: { user: User } };
 // What the app reports about a user's day: things done with a phrase, and things done once a day.
 const PHRASE_ACTIVITY = new Set<ActivityKind>(['phrase_heard', 'phrase_translated']);
 const DAY_ACTIVITY = new Set<ActivityKind>(['reminder_opened', 'today_viewed']);
+/** What a swipe off Today says about a phrase. */
+const REVIEW_KINDS = { read: 'phrase_read', remembered: 'phrase_remembered' } as const satisfies Record<string, ActivityKind>;
 
 /** The refresh token from a JSON body, or an empty string. */
 function refreshTokenOf(body: any): string {
@@ -515,6 +519,31 @@ export function createApp({
   });
 
   app.get('/api/today', requireUser, async (c) => c.json(await listToday(db, c.get('user').id)));
+
+  // Swiping a phrase away from Today: it was read, or remembered. Today leaves it out until a
+  // later reminder sends it again, and the activity keeps which, to tell whether reading is enough.
+  app.post('/api/phrases/:id/review', requireUser, async (c) => {
+    const user = c.get('user');
+    const body = await c.req.json().catch(() => null);
+    // Only these two: indexing with anything else could find an object's own keys, such as constructor.
+    const kind = body?.as === 'read' || body?.as === 'remembered' ? REVIEW_KINDS[body.as as 'read' | 'remembered'] : null;
+    if (!kind) return c.json({ error: 'as must be read or remembered' }, 400);
+    const id = parsePhraseId(c.req.param('id'));
+    if (id === null || !(await markReviewed(db, user.id, id, true))) return c.json({ error: say(c).phraseNotFound }, 404);
+    const day = await userDay(user.id);
+    await forgetActivity(db, user.id, day, [...Object.values(REVIEW_KINDS)], id); // One answer a day: the latest.
+    await recordActivity(db, user.id, day, kind, id);
+    return c.body(null, 204);
+  });
+
+  // Undoing the swipe: back on Today, and today's answer forgotten.
+  app.delete('/api/phrases/:id/review', requireUser, async (c) => {
+    const user = c.get('user');
+    const id = parsePhraseId(c.req.param('id'));
+    if (id === null || !(await markReviewed(db, user.id, id, false))) return c.json({ error: say(c).phraseNotFound }, 404);
+    await forgetActivity(db, user.id, await userDay(user.id), [...Object.values(REVIEW_KINDS)], id);
+    return c.body(null, 204);
+  });
 
   app.post('/api/phrases', requireUser, async (c) => {
     const body = await c.req.json().catch(() => null);

@@ -162,6 +162,9 @@ export async function ensureSchema(db: Db): Promise<void> {
   await db.query('CREATE INDEX IF NOT EXISTS push_subscriptions_user_id ON push_subscriptions (user_id)');
   // The score, from 1 to 10, of the last time the user said the phrase aloud. The recording isn't kept.
   await db.query('ALTER TABLE phrases ADD COLUMN IF NOT EXISTS last_score SMALLINT');
+  // When the user last swiped the phrase away from Today as read or remembered. It comes back
+  // when a later reminder sends it again, since that sets a newer last_shown_at.
+  await db.query('ALTER TABLE phrases ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ');
   // One row per login, kept while the app uses it (see auth.ts). Only hashes of refresh
   // tokens are kept; the one each refresh replaced stays a while to notice it coming back.
   await db.query(`
@@ -465,7 +468,10 @@ export type ActivityKind =
   | 'today_viewed'
   | 'phrase_heard'
   | 'phrase_translated'
-  | 'phrase_scored';
+  | 'phrase_scored'
+  /** Swiped away from Today: just read, or remembered. */
+  | 'phrase_read'
+  | 'phrase_remembered';
 
 /** Records that the user did this on their local day. Doing it again the same day changes nothing. */
 export async function recordActivity(
@@ -491,6 +497,8 @@ export interface WeekActivity {
   todayViewed: number;
   /** Different phrases heard, translated, or said aloud. */
   phrasesPracticed: number;
+  /** Phrases the user swiped away from Today as remembered, rather than just read. */
+  phrasesRemembered: number;
 }
 
 /** Each user's activity for the weeks that began within the last `weeks` weeks, oldest first. */
@@ -501,8 +509,10 @@ export async function weeklyActivity(db: Db, weeks: number): Promise<WeekActivit
        (count(DISTINCT a.day) FILTER (WHERE a.kind = 'reminder_sent'))::int AS "remindersSent",
        (count(DISTINCT a.day) FILTER (WHERE a.kind = 'reminder_opened'))::int AS "remindersOpened",
        (count(DISTINCT a.day) FILTER (WHERE a.kind = 'today_viewed'))::int AS "todayViewed",
-       (count(DISTINCT a.phrase_id) FILTER (WHERE a.kind IN ('phrase_heard', 'phrase_translated', 'phrase_scored')))::int
-         AS "phrasesPracticed"
+       (count(DISTINCT a.phrase_id) FILTER (WHERE a.kind IN
+         ('phrase_heard', 'phrase_translated', 'phrase_scored', 'phrase_read', 'phrase_remembered')))::int
+         AS "phrasesPracticed",
+       (count(DISTINCT a.phrase_id) FILTER (WHERE a.kind = 'phrase_remembered'))::int AS "phrasesRemembered"
      FROM activity a JOIN users u ON u.id = a.user_id
      WHERE date_trunc('week', a.day::date) > date_trunc('week', current_date) - make_interval(weeks => $1)
      GROUP BY u.email, week
@@ -728,6 +738,7 @@ export async function listToday(db: Db, userId: number): Promise<Phrase[]> {
      WHERE user_id = $1
        AND last_shown_at = (SELECT max(last_shown_at) FROM phrases WHERE user_id = $1)
        AND last_shown_at > now() - interval '24 hours'
+       AND (reviewed_at IS NULL OR reviewed_at < last_shown_at)
      ORDER BY id`,
     [userId],
   );
@@ -968,4 +979,24 @@ export async function capacityFacts(db: Db): Promise<{ limitedUsers: number; ave
       (SELECT count(*)::int FROM push_subscriptions) AS devices
   `);
   return rows[0];
+}
+
+/** Marks the user's phrase as reviewed now, which takes it off Today, or as not reviewed, to undo that. False if it isn't theirs. */
+export async function markReviewed(db: Db, userId: number, phraseId: number, reviewed: boolean): Promise<boolean> {
+  const { rows } = await db.query(
+    `UPDATE phrases SET reviewed_at = CASE WHEN $3 THEN now() ELSE NULL END
+     WHERE id = $1 AND user_id = $2 RETURNING id`,
+    [phraseId, userId, reviewed],
+  );
+  return rows.length > 0;
+}
+
+/** Takes back what was recorded of these kinds for a phrase on a day, as when a swipe is undone. */
+export async function forgetActivity(db: Db, userId: number, day: string, kinds: ActivityKind[], phraseId: number): Promise<void> {
+  await db.query('DELETE FROM activity WHERE user_id = $1 AND day = $2 AND kind = ANY($3::text[]) AND phrase_id = $4', [
+    userId,
+    day,
+    kinds,
+    phraseId,
+  ]);
 }
