@@ -13,8 +13,8 @@ const answer = (content: unknown) => ({
 });
 
 const OPTIONS = {
-  formal: { text: 'Could you please take a look?', es: '¿Podría revisarlo, por favor?' },
-  informal: { text: 'Can you take a look?', es: '¿Le echas un ojo?' },
+  formal: { text: 'Could you please take a look?' },
+  informal: { text: 'Can you take a look?' },
 };
 
 describe('Groq suggester', () => {
@@ -34,6 +34,7 @@ describe('Groq suggester', () => {
     expect(body.response_format.type).toBe('json_schema');
     expect(body.response_format.json_schema.strict).toBe(true);
     expect(body.response_format.json_schema.schema.required).toEqual(['formal', 'informal']);
+    expect(body.response_format.json_schema.schema.properties.formal.required).toEqual(['text']); // No Spanish.
   });
 
   it('keeps the phrase out of the instructions, which say not to follow it', async () => {
@@ -69,11 +70,11 @@ describe('Groq suggester', () => {
   });
 
   it('trims the options', async () => {
-    const fetch = fakeFetch(answer({ formal: { text: ' Hello. ', es: ' Hola. ' }, informal: { text: 'Hi!\n', es: '¡Hola!' } }));
+    const fetch = fakeFetch(answer({ formal: { text: ' Hello. ' }, informal: { text: 'Hi!\n' } }));
 
     expect(await createGroqSuggester({ apiKey: 'k', fetch })('Hola')).toEqual({
-      formal: { text: 'Hello.', es: 'Hola.' },
-      informal: { text: 'Hi!', es: '¡Hola!' },
+      formal: { text: 'Hello.' },
+      informal: { text: 'Hi!' },
     });
   });
 
@@ -83,8 +84,8 @@ describe('Groq suggester', () => {
     ['an empty answer', answer(''), 200],
     ['an answer that is not JSON', answer('Sure! Here you go'), 200],
     ['a missing option', answer({ formal: OPTIONS.formal }), 200],
-    ['an empty option', answer({ ...OPTIONS, informal: { text: ' ', es: 'x' } }), 200],
-    ['an option too long to save', answer({ ...OPTIONS, formal: { text: 'x'.repeat(501), es: 'x' } }), 200],
+    ['an empty option', answer({ ...OPTIONS, informal: { text: ' ' } }), 200],
+    ['an option too long to save', answer({ ...OPTIONS, formal: { text: 'x'.repeat(501) } }), 200],
   ])('throws for %s', async (_name, body, status) => {
     await expect(createGroqSuggester({ apiKey: 'k', fetch: fakeFetch(body, status) })('Hola')).rejects.toThrow();
   });

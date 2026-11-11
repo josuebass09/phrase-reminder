@@ -93,7 +93,7 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `PATCH /api/phrases/:id` with `{ text }` | Yes | The updated phrase, or 404 |
 | `DELETE /api/phrases/:id` | Yes | 204, or 404 |
 | `GET /api/phrases/:id/translation` | Yes | `{ translation }` in Spanish, or 404. 429 once the user's new translations for the day are used up, and 502 if the translation service fails |
-| `POST /api/suggestions` with `{ text }`, and optionally `context` | Yes | `{ formal, informal }`, each `{ text, es }`: two ways to say the text in English, with their Spanish. `context` (up to 300 characters) says who it's for, where, or what it's about, so the options fit. Saves nothing. 429 once the user's suggestions for the day are used up, 502 if the AI fails, 503 without `GROQ_API_KEY` |
+| `POST /api/suggestions` with `{ text }`, and optionally `context` | Yes | `{ formal, informal }`, each `{ text }`: two ways to say the text in English. `context` (up to 300 characters) says who it's for, where, or what it's about, so the options fit. Saves nothing. 429 once the user's suggestions for the day are used up, 502 if the AI fails, 503 without `GROQ_API_KEY` |
 | `GET /api/usage` | Yes | `{ translations, suggestions }`, each `{ used, limit }`: what the user has used today, and the daily limit (`null` for the admin) |
 | `POST /api/push/subscribe` with a `PushSubscription` | Yes | 204 |
 
@@ -113,7 +113,7 @@ The app speaks English or Spanish, and each user's choice is saved as `language`
 
 ## Suggestions
 
-The app's Get options button takes a new phrase the user wants to say, in Spanish or English, and shows a formal and an informal way to say it in English, each with its Spanish. An optional context, such as "Slack message to my manager about a late deploy", helps the AI fit the words and tone to the situation. Saving one adds it as a phrase with that Spanish as its translation, so translating it later is free.
+The app's Translate button takes a new phrase the user wants to say, in Spanish or English, and shows a formal and an informal way to say it, in English only. An optional context, such as "Slack message to my manager about a late deploy", helps the AI fit the words and tone to the situation. Saving one adds it as a phrase, which translates to Spanish like any other.
 
 The backend asks `openai/gpt-oss-120b` on [Groq](https://console.groq.com/), whose free plan needs no card. Create a key under API Keys and set it as `GROQ_API_KEY` on the web service; `GROQ_MODEL` picks another model. The free plan allows about 1,000 requests a day and 30 a minute for the whole account (see [rate limits](https://console.groq.com/docs/rate-limits)), so each user may ask for 20 suggestions a day, counted like translations: on their local day, a failed answer is given back, and the admin has no limit. Set `SUGGESTIONS_PER_DAY` to change the 20. With 20 users, that's at most 400 requests a day. What users type is sent to Groq.
 

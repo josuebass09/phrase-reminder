@@ -506,8 +506,8 @@ describe('GET /api/phrases/:id/translation', () => {
 
 describe('POST /api/suggestions', () => {
   const OPTIONS = {
-    formal: { text: 'Could you please take a look?', es: '¿Podría revisarlo, por favor?' },
-    informal: { text: 'Can you take a look?', es: '¿Le echas un ojo?' },
+    formal: { text: 'Could you please take a look?' },
+    informal: { text: 'Can you take a look?' },
   };
 
   function appWith(suggest?: (text: string) => Promise<typeof OPTIONS>, suggestionsPerDay?: number) {
@@ -646,7 +646,7 @@ describe('messages for people', () => {
       db,
       tokenSecret: SECRET,
       vapidPublicKey: 'k',
-      suggest: async () => ({ formal: { text: 'a', es: 'a' }, informal: { text: 'b', es: 'b' } }),
+      suggest: async () => ({ formal: { text: 'a' }, informal: { text: 'b' } }),
       suggestionsPerDay: 1,
     });
     const ask = async () =>

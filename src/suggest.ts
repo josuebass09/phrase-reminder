@@ -1,10 +1,8 @@
-import { MAX_PHRASE_LENGTH, MAX_TRANSLATION_LENGTH } from './db.js';
+import { MAX_PHRASE_LENGTH } from './db.js';
 
-/** One way to say a phrase in English. */
+/** One way to say a phrase in English. Only the English: the app shows nothing else. */
 export interface PhraseOption {
   text: string;
-  /** What the English says, in Spanish, so the user sees the difference between the options. */
-  es: string;
 }
 
 /** Two ways to say what the user wants: one for work, one for friends. */
@@ -42,14 +40,12 @@ Give two natural ways to say the phrase in English, as a native speaker would:
 - formal: polite and professional, for work emails, meetings or people you don't know.
 - informal: relaxed and friendly, for friends, family or close teammates.
 
-When there is context, use it to choose the words, the tone and the details that fit that situation best, in both options. Keep the meaning, who is speaking and the tense. If it is a question, both options are questions. Fix any mistakes. Keep names, products and technical terms as they are.
-
-For each option, es is what that English option says, in natural Latin American Spanish.`;
+When there is context, use it to choose the words, the tone and the details that fit that situation best, in both options. Keep the meaning, who is speaking and the tense. If it is a question, both options are questions. Fix any mistakes. Keep names, products and technical terms as they are. Write both options in English only.`;
 
 const OPTION_SCHEMA = {
   type: 'object',
-  properties: { text: { type: 'string' }, es: { type: 'string' } },
-  required: ['text', 'es'],
+  properties: { text: { type: 'string' } },
+  required: ['text'],
   additionalProperties: false,
 };
 
@@ -68,12 +64,9 @@ function userMessage(text: string, context?: string): string {
 
 function readOption(value: any, name: string): PhraseOption {
   const text = typeof value?.text === 'string' ? value.text.trim() : '';
-  const es = typeof value?.es === 'string' ? value.es.trim() : '';
   // Each option must fit as a phrase the user can save.
-  if (!text || !es || text.length > MAX_PHRASE_LENGTH || es.length > MAX_TRANSLATION_LENGTH) {
-    throw new Error(`Groq gave an unusable ${name} option`);
-  }
-  return { text, es };
+  if (!text || text.length > MAX_PHRASE_LENGTH) throw new Error(`Groq gave an unusable ${name} option`);
+  return { text };
 }
 
 /**
