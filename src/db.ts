@@ -209,6 +209,23 @@ export async function ensureSchema(db: Db): Promise<void> {
       PRIMARY KEY (day, service)
     )
   `);
+  // Each run of the reminder cron, for the admin to see it's running and delivering. Kept 30 days.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS cron_runs (
+      id          SERIAL PRIMARY KEY,
+      started_at  TIMESTAMPTZ NOT NULL,
+      finished_at TIMESTAMPTZ NOT NULL,
+      users       INTEGER NOT NULL DEFAULT 0,
+      devices     INTEGER NOT NULL DEFAULT 0,
+      delivered   INTEGER NOT NULL DEFAULT 0,
+      removed     INTEGER NOT NULL DEFAULT 0,
+      errors      INTEGER NOT NULL DEFAULT 0,
+      first_error TEXT,
+      version     TEXT
+    )
+  `);
+  await db.query('CREATE INDEX IF NOT EXISTS cron_runs_started_at ON cron_runs (started_at)');
+
   // What Groq last said about each model's daily requests, from its rate-limit headers.
   await db.query(`
     CREATE TABLE IF NOT EXISTS ai_quota (
@@ -809,6 +826,57 @@ export interface AiQuota {
 export async function aiQuotas(db: Db): Promise<AiQuota[]> {
   const { rows } = await db.query(
     'SELECT service, requests_limit AS "limit", requests_left AS "left", checked_at AS "checkedAt" FROM ai_quota ORDER BY service',
+  );
+  return rows;
+}
+
+/** One run of the reminder cron. */
+export interface CronRun {
+  startedAt: Date;
+  finishedAt: Date;
+  /** Users whose reminder went out, devices it went to, and devices that received it. */
+  users: number;
+  devices: number;
+  delivered: number;
+  /** Devices whose subscription was gone, and removed. */
+  removed: number;
+  errors: number;
+  /** The first error's message, to tell what went wrong without the logs. */
+  firstError: string | null;
+  /** The commit the cron ran, from Railway. */
+  version: string | null;
+}
+
+/** How long cron runs are kept: enough for a month of trends, at 96 runs a day. */
+const CRON_RUNS_KEPT_DAYS = 30;
+
+/** Saves a cron run, and drops the ones older than 30 days. */
+export async function recordCronRun(db: Db, run: CronRun): Promise<void> {
+  await db.query(
+    `INSERT INTO cron_runs (started_at, finished_at, users, devices, delivered, removed, errors, first_error, version)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    [
+      run.startedAt,
+      run.finishedAt,
+      run.users,
+      run.devices,
+      run.delivered,
+      run.removed,
+      run.errors,
+      run.firstError?.slice(0, 500) ?? null,
+      run.version,
+    ],
+  );
+  await db.query(`DELETE FROM cron_runs WHERE started_at < $1::timestamptz - interval '${CRON_RUNS_KEPT_DAYS} days'`, [run.startedAt]);
+}
+
+/** The cron runs since `since`, newest first. */
+export async function cronRunsSince(db: Db, since: Date): Promise<CronRun[]> {
+  const { rows } = await db.query(
+    `SELECT started_at AS "startedAt", finished_at AS "finishedAt", users, devices, delivered, removed, errors,
+       first_error AS "firstError", version
+     FROM cron_runs WHERE started_at >= $1 ORDER BY started_at DESC`,
+    [since],
   );
   return rows;
 }

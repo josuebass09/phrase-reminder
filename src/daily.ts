@@ -18,6 +18,8 @@ export interface DailyResult {
   phrases: number;
   devices: number;
   delivered: number;
+  /** Devices whose subscription no longer exists, now removed. */
+  removed: number;
   errors: unknown[];
 }
 
@@ -26,13 +28,13 @@ function subscriptionIsGone(error: unknown): boolean {
   return status === 404 || status === 410;
 }
 
-/** Sends one payload to each device and returns how many received it. */
+/** Sends one payload to each device and returns how many received it, counting gone devices and errors in `result`. */
 async function pushToDevices(
   db: Db,
   send: PushSender,
   subscriptions: DeviceSubscription[],
   payload: string,
-  errors: unknown[],
+  result: DailyResult,
 ): Promise<number> {
   const outcomes = await Promise.allSettled(subscriptions.map((subscription) => send(subscription, payload)));
   let delivered = 0;
@@ -41,8 +43,9 @@ async function pushToDevices(
       delivered += 1;
     } else if (subscriptionIsGone(outcome.reason)) {
       await deleteSubscription(db, subscriptions[i].endpoint);
+      result.removed += 1;
     } else {
-      errors.push(outcome.reason);
+      result.errors.push(outcome.reason);
     }
   }
   return delivered;
@@ -56,7 +59,7 @@ async function pushToDevices(
  * next one. Devices whose subscription no longer exists are removed.
  */
 export async function sendDueReminders(db: Db, send: PushSender, now = new Date()): Promise<DailyResult> {
-  const result: DailyResult = { users: 0, phrases: 0, devices: 0, delivered: 0, errors: [] };
+  const result: DailyResult = { users: 0, phrases: 0, devices: 0, delivered: 0, removed: 0, errors: [] };
 
   for (const candidate of await listReminderCandidates(db)) {
     const { userId } = candidate;
@@ -78,7 +81,7 @@ export async function sendDueReminders(db: Db, send: PushSender, now = new Date(
     result.devices += subscriptions.length;
 
     const payload = notificationPayload(phrases, localClock(now, candidate.timeZone).minutes, candidate.language ?? 'en');
-    const delivered = await pushToDevices(db, send, subscriptions, payload, result.errors);
+    const delivered = await pushToDevices(db, send, subscriptions, payload, result);
     result.delivered += delivered;
     if (delivered > 0) {
       await markShown(db, phrases.map((phrase) => phrase.id));

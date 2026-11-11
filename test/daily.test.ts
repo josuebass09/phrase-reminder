@@ -51,7 +51,7 @@ describe('sendDueReminders', () => {
 
     const result = await sendDueReminders(db, send, NOON);
 
-    expect(result).toEqual({ users: 1, phrases: 1, devices: 2, delivered: 2, errors: [] });
+    expect(result).toEqual({ users: 1, phrases: 1, devices: 2, delivered: 2, removed: 0, errors: [] });
     expect(sentBodies(send)).toEqual({ [phone.endpoint]: '• old one', [laptop.endpoint]: '• old one' });
     expect(await shownTexts()).toEqual(['old one']);
   });
@@ -76,7 +76,7 @@ describe('sendDueReminders', () => {
 
     const result = await sendDueReminders(db, send, NOON);
 
-    expect(result).toEqual({ users: 0, phrases: 0, devices: 0, delivered: 0, errors: [] });
+    expect(result).toEqual({ users: 0, phrases: 0, devices: 0, delivered: 0, removed: 0, errors: [] });
     expect(send).not.toHaveBeenCalled();
   });
 
@@ -158,6 +158,7 @@ describe('sendDueReminders', () => {
     const result = await sendDueReminders(db, send, NOON);
 
     expect(result.errors).toEqual([]);
+    expect(result.removed).toBe(1);
     expect(await listSubscriptions(db, alice.id)).toEqual([]);
     expect(await shownTexts()).toEqual([]);
   });

@@ -2,6 +2,8 @@ import { PGlite } from '@electric-sql/pglite';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   aiQuotas,
+  cronRunsSince,
+  recordCronRun,
   aiUsageSince,
   recordAiUse,
   addPhrase,
@@ -480,6 +482,43 @@ describe('AI usage', () => {
     expect(await aiQuotas(db)).toEqual([
       { service: 'groq_chat', limit: 1000, left: 899, checkedAt: new Date('2026-11-11T10:05:00Z') },
     ]);
+  });
+});
+
+describe('cron runs', () => {
+  const run = (startedAt: string, changes: Partial<Parameters<typeof recordCronRun>[1]> = {}) => ({
+    startedAt: new Date(startedAt),
+    finishedAt: new Date(new Date(startedAt).getTime() + 2000),
+    users: 2,
+    devices: 3,
+    delivered: 3,
+    removed: 0,
+    errors: 0,
+    firstError: null,
+    version: 'abc1234',
+    ...changes,
+  });
+
+  it('keeps each run, newest first', async () => {
+    await recordCronRun(db, run('2026-11-11T12:00:00Z'));
+    await recordCronRun(db, run('2026-11-11T12:15:00Z', { errors: 1, delivered: 2, firstError: 'Push service down' }));
+
+    const runs = await cronRunsSince(db, new Date('2026-11-11T00:00:00Z'));
+
+    expect(runs.map((each) => [each.startedAt.toISOString(), each.errors, each.firstError])).toEqual([
+      ['2026-11-11T12:15:00.000Z', 1, 'Push service down'],
+      ['2026-11-11T12:00:00.000Z', 0, null],
+    ]);
+    expect(runs[0]).toMatchObject({ users: 2, devices: 3, delivered: 2, removed: 0, version: 'abc1234' });
+  });
+
+  it('drops runs older than 30 days', async () => {
+    await recordCronRun(db, run('2026-10-01T12:00:00Z'));
+    await recordCronRun(db, run('2026-11-11T12:00:00Z'));
+
+    const runs = await cronRunsSince(db, new Date('2026-01-01T00:00:00Z'));
+
+    expect(runs).toHaveLength(1);
   });
 });
 
