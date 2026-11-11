@@ -39,6 +39,17 @@ export class NoSpeechError extends Error {
   }
 }
 
+/**
+ * The recording holds no audio Whisper can read: the microphone sent no sound at all. On iOS 27
+ * this happens after the phone reads a phrase aloud, which leaves the page's microphone silent
+ * until it reloads (https://bugs.webkit.org/show_bug.cgi?id=218815).
+ */
+export class NoAudioError extends Error {
+  constructor() {
+    super('No audio in the recording');
+  }
+}
+
 /** Scores how the user said the phrase. Throws NoSpeechError for a recording with nobody speaking. */
 export type Pronouncer = (phrase: string, recording: Recording, language: Language) => Promise<Pronunciation>;
 
@@ -236,7 +247,11 @@ export function createGroqPronouncer({
       body: form,
       signal: AbortSignal.timeout(timeoutMs),
     });
-    if (!response.ok) await failedRequest(response);
+    if (!response.ok) {
+      const detail = await response.clone().text().catch(() => '');
+      if (response.status === 400 && detail.includes('invalid_media_file')) throw new NoAudioError();
+      await failedRequest(response);
+    }
 
     const body: any = await response.json().catch(() => null);
     if (typeof body?.text !== 'string') throw new Error('Groq gave no transcription');

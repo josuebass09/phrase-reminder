@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createGroqPronouncer, NoSpeechError, recordingType, scoreHearing, wordKey } from '../src/pronounce.js';
+import { createGroqPronouncer, NoAudioError, NoSpeechError, recordingType, scoreHearing, wordKey } from '../src/pronounce.js';
 
 const PHRASE = 'It slipped my mind.';
 const RECORDING = { bytes: new TextEncoder().encode('fake audio').buffer, type: 'audio/webm' };
@@ -193,5 +193,25 @@ describe('Groq pronouncer', () => {
 
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(NoSpeechError);
+    expect(error).not.toBeInstanceOf(NoAudioError);
+  });
+
+  it('throws NoAudioError when Groq finds no audio in the file, as from a silenced iPhone microphone', async () => {
+    const invalid = '{"error":{"message":"could not process file - is it a valid media file?","type":"invalid_request_error","code":"invalid_media_file"}}';
+    const pronounce = createGroqPronouncer({ apiKey: 'k', fetch: vi.fn(async () => new Response(invalid, { status: 400 })) });
+
+    await expect(pronounce(PHRASE, RECORDING, 'en')).rejects.toBeInstanceOf(NoAudioError);
+  });
+
+  it('throws a plain error for any other bad request', async () => {
+    const pronounce = createGroqPronouncer({
+      apiKey: 'k',
+      fetch: vi.fn(async () => new Response('{"error":{"code":"model_not_found"}}', { status: 400 })),
+    });
+
+    const error = await pronounce(PHRASE, RECORDING, 'en').catch((caught) => caught);
+
+    expect(error.message).toContain('model_not_found');
+    expect(error).not.toBeInstanceOf(NoAudioError);
   });
 });

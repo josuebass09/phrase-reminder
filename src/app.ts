@@ -53,7 +53,7 @@ import {
 import { hashInviteCode, INVITE_LIFETIME_DAYS, newInviteCode } from './invites.js';
 import { isLanguage, languageFrom, messagesFor, type Messages } from './messages.js';
 import { checkNewPassword, dummyHash, hashPassword, MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
-import { MAX_RECORDING_BYTES, NoSpeechError, recordingType, type Pronouncer, type Pronunciation } from './pronounce.js';
+import { MAX_RECORDING_BYTES, NoAudioError, NoSpeechError, recordingType, type Pronouncer, type Pronunciation } from './pronounce.js';
 import { isValidTime, isValidTimeZone, localClock, MAX_PHRASES_PER_DAY } from './schedule.js';
 import { MAX_CONTEXT_LENGTH, type Suggester } from './suggest.js';
 import type { Translator } from './translate.js';
@@ -509,6 +509,11 @@ export function createApp({
       } catch (error) {
         await releaseDailyUse(db, user.id, 'pronunciations', day);
         if (error instanceof NoSpeechError) return c.json({ error: m.noSpeech }, 422);
+        if (error instanceof NoAudioError) {
+          // Its size and type tell a dead microphone from a format Whisper can't read.
+          console.warn(`Recording without audio: ${type}, ${bytes.byteLength} bytes`);
+          return c.json({ error: m.noAudio }, 422);
+        }
         console.error('Pronunciation failed:', error);
         return c.json({ error: m.pronunciationFailed }, 502);
       }

@@ -56,6 +56,7 @@ const en = {
   pronunciationLimit: (limit: number) => `You've used today's ${limit} pronunciation scores. More tomorrow.`,
   pronunciationFailed: "Couldn't score it right now. Try again.",
   noSpeech: "Couldn't hear you. Get closer to the microphone and try again.",
+  noAudio: "The recording came with no sound. On iPhone, the microphone goes quiet after a phrase is read aloud: reload the page and try again.",
 };
 
 export type Messages = typeof en;
@@ -87,6 +88,7 @@ const es: Messages = {
   pronunciationLimit: (limit) => `Ya usaste las ${limit} calificaciones de pronunciación de hoy. Mañana tendrás más.`,
   pronunciationFailed: 'No se pudo calificar en este momento. Inténtalo de nuevo.',
   noSpeech: 'No te escuché. Acércate al micrófono e inténtalo de nuevo.',
+  noAudio: 'La grabación llegó sin sonido. En iPhone, el micrófono se queda en silencio después de escuchar una frase: recarga la página e inténtalo de nuevo.',
 };
 
 const MESSAGES: Record<Language, Messages> = { en, es };

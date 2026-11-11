@@ -14,7 +14,7 @@ import {
 } from '../src/db.js';
 import { hashPassword } from '../src/passwords.js';
 import { localClock } from '../src/schedule.js';
-import { MAX_RECORDING_BYTES, NoSpeechError, type Pronouncer, type Pronunciation } from '../src/pronounce.js';
+import { MAX_RECORDING_BYTES, NoAudioError, NoSpeechError, type Pronouncer, type Pronunciation } from '../src/pronounce.js';
 import { clearTables, createTestDb, insertAged, insertUser, openSession } from './helpers.js';
 
 const PASSWORD = 'correct horse battery staple';
@@ -950,6 +950,21 @@ describe('POST /api/phrases/:id/pronunciation', () => {
 
     expect(response.status).toBe(422);
     expect(await response.json()).toEqual({ error: 'No te escuché. Acércate al micrófono e inténtalo de nuevo.' });
+    expect(await usage(target, bob)).toEqual({ used: 0, limit: 20 });
+    expect(await lastScore(bob)).toBeNull();
+  });
+
+  it('answers 422 for a recording with no sound, says to reload, and does not count it', async () => {
+    const phrase = await addPhrase(db, bob.id, 'Hello');
+    const target = appWith(vi.fn().mockRejectedValue(new NoAudioError()));
+    const quiet = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const response = await speak(target, bob, phrase.id, { language: 'es' });
+
+    expect(response.status).toBe(422);
+    expect((await response.json()).error).toContain('recarga la página');
+    expect(quiet).toHaveBeenCalledWith(expect.stringMatching(/^Recording without audio: audio\/\S+, \d+ bytes$/));
+    quiet.mockRestore();
     expect(await usage(target, bob)).toEqual({ used: 0, limit: 20 });
     expect(await lastScore(bob)).toBeNull();
   });
