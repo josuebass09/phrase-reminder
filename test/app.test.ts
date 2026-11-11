@@ -369,7 +369,63 @@ describe('GET /api/phrases', () => {
     const phrases = await (await requestAs(alice, '/api/phrases')).json();
 
     expect(textOf(phrases)).toEqual(['newer', 'older']);
-    expect(phrases[0]).toEqual({ id: expect.any(Number), text: 'newer', createdAt: expect.any(String), lastScore: null });
+    expect(phrases[0]).toEqual({
+      id: expect.any(Number),
+      text: 'newer',
+      createdAt: expect.any(String),
+      translation: null,
+      lastScore: null,
+    });
+  });
+});
+
+describe('GET /api/phrases, searching and paging', () => {
+  const texts = async (query: string) => textOf(await (await requestAs(alice, `/api/phrases${query}`)).json());
+
+  it("gives each phrase's Spanish, once someone asked for it", async () => {
+    const phrase = await addPhrase(db, alice.id, 'It slipped my mind.', 'Se me olvidó.');
+
+    const [listed] = await (await requestAs(alice, '/api/phrases')).json();
+
+    expect(listed).toMatchObject({ id: phrase.id, translation: 'Se me olvidó.' });
+  });
+
+  it('finds phrases by their text or Spanish, ignoring case, and only the user’s', async () => {
+    await addPhrase(db, alice.id, 'It slipped my mind.', 'Se me olvidó.');
+    await addPhrase(db, alice.id, "I'll keep you posted.");
+    await addPhrase(db, alice.id, 'Mind the gap.');
+    await addPhrase(db, bob.id, 'Never mind.');
+
+    expect(await texts('?q=MIND')).toEqual(['Mind the gap.', 'It slipped my mind.']);
+    expect(await texts('?q=olvid')).toEqual(['It slipped my mind.']);
+    expect(await texts('?q=%20%20')).toHaveLength(3); // Blank means no search.
+  });
+
+  it('takes % and _ in a search literally', async () => {
+    await addPhrase(db, alice.id, '100% sure');
+    await addPhrase(db, alice.id, '100 percent sure');
+    await addPhrase(db, alice.id, 'snake_case');
+
+    expect(await texts('?q=100%25')).toEqual(['100% sure']);
+    expect(await texts('?q=e_c')).toEqual(['snake_case']);
+  });
+
+  it('gives the next 50 after a phrase, so all of them can be reached', async () => {
+    for (let i = 0; i < 52; i++) await insertAged(db, alice.id, `phrase ${i}`, 60 - i);
+
+    const first = await (await requestAs(alice, '/api/phrases')).json();
+    const next = await (await requestAs(alice, `/api/phrases?before=${first.at(-1).id}`)).json();
+
+    expect(first).toHaveLength(50);
+    expect(textOf(first).slice(0, 2)).toEqual(['phrase 51', 'phrase 50']);
+    expect(textOf(next)).toEqual(['phrase 1', 'phrase 0']);
+  });
+
+  it.each([
+    ['a search over 100 characters', `?q=${'x'.repeat(101)}`],
+    ['a before that is not an id', '?before=abc'],
+  ])('rejects %s', async (_name, query) => {
+    expect((await requestAs(alice, `/api/phrases${query}`)).status).toBe(400);
   });
 });
 
@@ -395,6 +451,7 @@ describe('PATCH /api/phrases/:id', () => {
       id: phrase.id,
       text: 'It slipped my mind.',
       createdAt: phrase.createdAt.toISOString(),
+      translation: null,
       lastScore: null,
     });
   });
@@ -474,7 +531,7 @@ describe('DELETE /api/phrases/:id', () => {
 describe('GET /api/today', () => {
   async function sendPhrase(user: User, text: string) {
     await insertAged(db, user.id, text, 20);
-    const [phrase] = await listRecent(db, user.id, 1);
+    const [phrase] = await listRecent(db, user.id, { limit: 1 });
     await markShown(db, [phrase.id]);
   }
 

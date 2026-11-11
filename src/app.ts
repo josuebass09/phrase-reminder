@@ -118,6 +118,9 @@ function parseSubscription(body: any): DeviceSubscription | null {
 
 const MAX_PHRASE_ID = 2_147_483_647; // Postgres SERIAL is a 32-bit integer.
 
+/** Longer than any phrase worth searching for. */
+const MAX_SEARCH_LENGTH = 100;
+
 /** Reads a phrase id from the URL. Anything that can't be a stored id is null. */
 function parsePhraseId(value: string): number | null {
   if (!/^\d{1,10}$/.test(value)) return null;
@@ -383,7 +386,16 @@ export function createApp({
     return c.json(await updateSettings(db, c.get('user').id, parsed.changes));
   });
 
-  app.get('/api/phrases', requireUser, async (c) => c.json(await listRecent(db, c.get('user').id)));
+  // Newest first, 50 at a time: ?before=<id> gives the 50 after that phrase, and ?q= only those
+  // whose text or Spanish has it.
+  app.get('/api/phrases', requireUser, async (c) => {
+    const search = (c.req.query('q') ?? '').trim();
+    if (search.length > MAX_SEARCH_LENGTH) return c.json({ error: `q must be at most ${MAX_SEARCH_LENGTH} characters` }, 400);
+    const beforeParam = c.req.query('before');
+    const before = beforeParam === undefined ? null : parsePhraseId(beforeParam);
+    if (beforeParam !== undefined && before === null) return c.json({ error: 'before must be a phrase id' }, 400);
+    return c.json(await listRecent(db, c.get('user').id, { search: search || undefined, before: before ?? undefined }));
+  });
 
   app.get('/api/today', requireUser, async (c) => c.json(await listToday(db, c.get('user').id)));
 

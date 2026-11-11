@@ -56,6 +56,8 @@ export interface Phrase {
   id: number;
   text: string;
   createdAt: Date;
+  /** The Spanish translation, once someone has asked for it, or null. */
+  translation: string | null;
   /** The score of the last time the user said it aloud, from 1 to 10, or null if never. */
   lastScore: number | null;
 }
@@ -66,7 +68,8 @@ export interface DeviceSubscription {
   auth: string;
 }
 
-const PHRASE_COLUMNS = 'id, text, created_at AS "createdAt", last_score AS "lastScore"';
+const PHRASE_COLUMNS =
+  'id, text, created_at AS "createdAt", translation_es AS "translation", last_score AS "lastScore"';
 const USER_COLUMNS = 'id, email, is_admin AS "isAdmin"';
 const SETTINGS_COLUMNS =
   'reminders_on AS "remindersOn", reminder_time AS "reminderTime", time_zone AS "timeZone", phrases_per_day AS "phrasesPerDay", language';
@@ -633,13 +636,29 @@ export async function deletePhrase(db: Db, userId: number, id: number): Promise<
   return rows.length > 0;
 }
 
-export async function listRecent(db: Db, userId: number, limit = 50): Promise<Phrase[]> {
+export interface PhraseQuery {
+  /** Only phrases whose text or Spanish has this, ignoring case. */
+  search?: string;
+  /** Only phrases saved before this one, to load the next page after it. */
+  before?: number;
+  limit?: number;
+}
+
+/** Turns text into a LIKE pattern that finds it anywhere, with LIKE's own characters taken literally. */
+function containing(text: string): string {
+  return `%${text.replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
+}
+
+/** The user's phrases, newest first: all of them a page at a time, or those that match a search. */
+export async function listRecent(db: Db, userId: number, { search, before, limit = 50 }: PhraseQuery = {}): Promise<Phrase[]> {
   const { rows } = await db.query(
     `SELECT ${PHRASE_COLUMNS} FROM phrases
      WHERE user_id = $1
+       AND ($3::text IS NULL OR text ILIKE $3 OR translation_es ILIKE $3)
+       AND ($4::int IS NULL OR (created_at, id) < (SELECT created_at, id FROM phrases WHERE id = $4 AND user_id = $1))
      ORDER BY created_at DESC, id DESC
      LIMIT $2`,
-    [userId, limit],
+    [userId, limit, search ? containing(search) : null, before ?? null],
   );
   return rows;
 }

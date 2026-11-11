@@ -95,7 +95,7 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `GET /api/me` | Yes | `{ id, email, isAdmin }` |
 | `GET /api/settings` | Yes | `{ remindersOn, reminderTime, timeZone, phrasesPerDay, language }`; `language` is `null` until the app saves one |
 | `PATCH /api/settings` with any of those | Yes | All the settings after the change, or 400 with what's wrong. `reminderTime` is 24-hour `HH:MM`, `timeZone` an IANA zone such as `America/Costa_Rica`, `phrasesPerDay` 1 to 5, and `language` `en` or `es` |
-| `GET /api/phrases` | Yes | The user's 50 newest phrases |
+| `GET /api/phrases`, optionally with `?q=` and `?before=` | Yes | The user's 50 newest phrases. `q` (up to 100 characters) keeps only those whose text or Spanish has it, ignoring case, and `before`, a phrase's id, gives the 50 after that one |
 | `GET /api/today` | Yes | The phrases from the user's latest reminder |
 | `POST /api/phrases` with `{ text }`, and optionally `translation` | Yes | The saved phrase, 201. A `translation` (Spanish, up to 1,000 characters) is saved as the phrase's translation |
 | `PATCH /api/phrases/:id` with `{ text }` | Yes | The updated phrase, or 404 |
@@ -107,7 +107,7 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `POST /api/activity` with `{ kind }`, and `phraseId` for a phrase kind | Yes | 204, once recorded (see Activity). 400 for an unknown kind, or a phrase with a kind that has none, and 404 for a phrase that isn't the user's |
 | `POST /api/push/subscribe` with a `PushSubscription` | Yes | 204 |
 
-Send the token as `Authorization: Bearer <token>`. It's a JWT signed with `SESSION_SECRET`, and `expiresIn` is its lifetime in seconds (3600). Without a valid token, these requests get a 401. Phrases look like `{ id, text, createdAt, lastScore }`, where `lastScore` is the score of the last time the user said it aloud, or `null`. Another user's phrase gets the same 404 as a missing one.
+Send the token as `Authorization: Bearer <token>`. It's a JWT signed with `SESSION_SECRET`, and `expiresIn` is its lifetime in seconds (3600). Without a valid token, these requests get a 401. Phrases look like `{ id, text, createdAt, translation, lastScore }`, where `translation` is the saved Spanish, or `null` until someone asks for it, and `lastScore` is the score of the last time the user said it aloud, or `null`. Another user's phrase gets the same 404 as a missing one.
 
 ## Translations
 

@@ -296,7 +296,7 @@ describe('listRecent', () => {
     await insertAged(db, alice.id, 'newest', 1);
     await insertAged(db, bob.id, "bob's", 0);
 
-    const texts = (await listRecent(db, alice.id, 2)).map((p) => p.text);
+    const texts = (await listRecent(db, alice.id, { limit: 2 })).map((p) => p.text);
 
     expect(texts).toEqual(['newest', 'middle']);
   });
