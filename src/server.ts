@@ -1,6 +1,8 @@
 import { serve } from '@hono/node-server';
 import {
   createApp,
+  MYMEMORY_EMAIL_CHARS_PER_DAY,
+  MYMEMORY_FREE_CHARS_PER_DAY,
   DEFAULT_PRONUNCIATIONS_PER_DAY,
   DEFAULT_SUGGESTIONS_PER_DAY,
   DEFAULT_TRANSLATIONS_PER_DAY,
@@ -60,6 +62,8 @@ const app = createApp({
       })
     : undefined,
   pronunciationsPerDay: dailyLimit('PRONUNCIATIONS_PER_DAY', DEFAULT_PRONUNCIATIONS_PER_DAY),
+  mymemoryCharsPerDay: process.env.MYMEMORY_EMAIL ? MYMEMORY_EMAIL_CHARS_PER_DAY : MYMEMORY_FREE_CHARS_PER_DAY,
+  version: process.env.RAILWAY_GIT_COMMIT_SHA?.slice(0, 7) || null,
 });
 
 serve({ fetch: app.fetch, port: Number(process.env.PORT ?? 3000) }, ({ port }) => {

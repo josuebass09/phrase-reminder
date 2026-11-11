@@ -5,6 +5,10 @@ import { createAccessToken, hashRefreshToken } from '../src/auth.js';
 import {
   addPhrase,
   listRecent,
+  recordAiUse,
+  recordCronRun,
+  reserveDailyUse,
+  saveSubscription,
   listSubscriptions,
   listUsers,
   markShown,
@@ -1424,5 +1428,125 @@ describe('POST /api/signup', () => {
 
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error: 'Email, password, and invite code are required' });
+  });
+});
+
+describe('admin', () => {
+  const ADMIN_ROUTES = [
+    ['GET', '/api/admin/ai'],
+    ['GET', '/api/admin/users'],
+    ['GET', '/api/admin/system'],
+    ['DELETE', '/api/admin/users/2/sessions'],
+  ] as const;
+
+  it.each(ADMIN_ROUTES)('%s %s is only for the admin', async (method, path) => {
+    expect((await requestAs(null, path, { method })).status).toBe(401);
+    const refused = await requestAs(bob, path, { method });
+    expect(refused.status).toBe(403);
+    expect(await refused.json()).toEqual({ error: 'Only the admin can see this' });
+  });
+
+  it("gives each service's requests for the last 30 UTC days, what Groq said is left, and the users' limits", async () => {
+    const now = new Date();
+    const yesterday = new Date(now.getTime() - 86_400_000);
+    await recordAiUse(db, { service: 'groq_chat', ok: true, rateLimited: false, units: 400, quota: { limit: 1000, left: 990 } });
+    await recordAiUse(db, { service: 'groq_chat', ok: false, rateLimited: true, units: 0 });
+    await recordAiUse(db, { service: 'mymemory', ok: true, rateLimited: false, units: 20 }, yesterday);
+    await addPhrase(db, bob.id, 'Hello there'); // 11 characters.
+    await addPhrase(db, bob.id, 'Hi'); // 2.
+
+    const response = await requestAs(alice, '/api/admin/ai');
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.history).toHaveLength(30);
+    expect(body.history.at(-1)).toEqual({
+      day: now.toISOString().slice(0, 10),
+      groq_chat: { calls: 2, failures: 1, rateLimited: 1, units: 400 },
+      groq_speech: { calls: 0, failures: 0, rateLimited: 0, units: 0 },
+      mymemory: { calls: 0, failures: 0, rateLimited: 0, units: 0 },
+    });
+    expect(body.history.at(-2).mymemory).toEqual({ calls: 1, failures: 0, rateLimited: 0, units: 20 });
+    expect(body.quotas).toEqual({ groq_chat: { limit: 1000, left: 990, checkedAt: expect.any(String) }, groq_speech: null });
+    expect(body).toMatchObject({
+      mymemoryCharsPerDay: 5000,
+      available: { groq: false, mymemory: false },
+      perUserPerDay: { suggestions: 20, translations: 30, pronunciations: 20 },
+      limitedUsers: 1, // Bob; Alice is the admin.
+      averagePhraseLength: 7,
+    });
+  });
+
+  it('lists every user with their activity, devices, sessions, and what they used today', async () => {
+    const { timeZone } = (await (await requestAs(bob, '/api/settings')).json()) as { timeZone: string };
+    const today = localClock(new Date(), timeZone).day;
+    await addPhrase(db, bob.id, 'Hello');
+    await saveSubscription(db, bob.id, { endpoint: 'https://push.example/bob', p256dh: 'key', auth: 'auth' });
+    await reserveDailyUse(db, bob.id, 'suggestions', today, 20);
+    await reserveDailyUse(db, bob.id, 'suggestions', today, 20);
+    await reserveDailyUse(db, bob.id, 'translations', '2000-01-01', 30); // Another day: not today's.
+
+    const users = await (await requestAs(alice, '/api/admin/users')).json();
+
+    expect(users.map((user: { email: string; isAdmin: boolean }) => [user.email, user.isAdmin])).toEqual([
+      ['alice@example.com', true],
+      ['bob@example.com', false],
+    ]);
+    expect(users[1]).toMatchObject({
+      id: bob.id,
+      phrases: 1,
+      devices: 1,
+      sessions: 1, // From asking for the settings above.
+      remindersOn: true,
+      today: { suggestions: 2, translations: 0, pronunciations: 0 },
+    });
+    expect(new Date(users[1].lastActiveAt).getTime()).toBeGreaterThan(Date.now() - 60_000);
+    expect(new Date(users[1].createdAt).getTime()).toBeGreaterThan(0);
+  });
+
+  it("logs a user out of every device, keeping their phrases, but not the admin, who uses Settings", async () => {
+    const bobsToken = await bearer(bob);
+    await addPhrase(db, bob.id, 'Hello');
+
+    const response = await requestAs(alice, `/api/admin/users/${bob.id}/sessions`, { method: 'DELETE' });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ended: 1 });
+    expect((await app.request('/api/phrases', { headers: { Authorization: bobsToken } })).status).toBe(401);
+    expect(textOf(await listRecent(db, bob.id))).toEqual(['Hello']);
+
+    const own = await requestAs(alice, `/api/admin/users/${alice.id}/sessions`, { method: 'DELETE' });
+    expect(own.status).toBe(400);
+    expect((await requestAs(alice, '/api/admin/users/999/sessions', { method: 'DELETE' })).status).toBe(404);
+  });
+
+  it("gives the cron's last runs and deliveries, the database's size, and the deployed versions", async () => {
+    const versioned = createApp({ db, tokenSecret: SECRET, vapidPublicKey: 'test-public-key', version: 'abc1234' });
+    const now = Date.now();
+    const run = { users: 1, devices: 2, delivered: 2, removed: 0, errors: 0, firstError: null, version: 'def5678' };
+    await recordCronRun(db, { ...run, startedAt: new Date(now - 3 * 3600_000), finishedAt: new Date(now - 3 * 3600_000 + 900) });
+    await recordCronRun(db, {
+      ...run,
+      delivered: 1,
+      removed: 1,
+      errors: 1,
+      firstError: 'Push service down',
+      startedAt: new Date(now - 15 * 60_000),
+      finishedAt: new Date(now - 15 * 60_000 + 900),
+    });
+
+    const response = await versioned.request('/api/admin/system', { headers: { Authorization: await bearer(alice) } });
+    const { cron, database, versions, reminders } = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(new Date(cron.lastRunAt).getTime()).toBe(now - 15 * 60_000);
+    expect(cron).toMatchObject({ runsLastDay: 2, failedRunsLastDay: 1, removedLastWeek: 1 });
+    expect(cron.lastError).toEqual({ at: expect.any(String), message: 'Push service down' });
+    expect(cron.deliveries).toHaveLength(7);
+    expect(cron.deliveries.reduce((sum: number, day: { delivered: number }) => sum + day.delivered, 0)).toBe(3);
+    expect(database.bytes).toBeGreaterThan(0);
+    expect(database.tables.map((table: { name: string }) => table.name)).toContain('phrases');
+    expect(versions).toEqual({ api: 'abc1234', cron: 'def5678' });
+    expect(reminders).toEqual({ usersOn: 0, devices: 0 });
   });
 });

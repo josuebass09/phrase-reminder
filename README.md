@@ -106,6 +106,10 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `GET /api/usage` | Yes | `{ translations, suggestions, pronunciations }`, each `{ used, limit }`: what the user has used today, and the daily limit (`null` for the admin) |
 | `POST /api/activity` with `{ kind }`, and `phraseId` for a phrase kind | Yes | 204, once recorded (see Activity). 400 for an unknown kind, or a phrase with a kind that has none, and 404 for a phrase that isn't the user's |
 | `POST /api/push/subscribe` with a `PushSubscription` | Yes | 204 |
+| `GET /api/admin/ai` | Admin | Each AI service's requests on each of the last 30 UTC days, what Groq last said is left of its daily quotas, MyMemory's daily characters, and the users' limits (see Admin). 403 for other users |
+| `GET /api/admin/users` | Admin | Every user with their sign-up date, last activity, phrases, devices, open sessions, reminders on or off, and what they used today |
+| `DELETE /api/admin/users/:id/sessions` | Admin | `{ ended }`: logs the user out of every device, keeping their data. 400 for the admin's own account, which uses `DELETE /api/sessions`, and 404 for no such user |
+| `GET /api/admin/system` | Admin | The reminder cron's runs in the last day, its last error, deliveries on each of the last 7 days, the database's size and its biggest tables, and the commits running |
 
 Send the token as `Authorization: Bearer <token>`. It's a JWT signed with `SESSION_SECRET`, and `expiresIn` is its lifetime in seconds (3600). Without a valid token, these requests get a 401. Phrases look like `{ id, text, createdAt, translation, lastScore }`, where `translation` is the saved Spanish, or `null` until someone asks for it, and `lastScore` is the score of the last time the user said it aloud, or `null`. Another user's phrase gets the same 404 as a missing one.
 
@@ -144,6 +148,16 @@ To tell whether the reminders help, as `docs/ideas/phrase-reminder.md` asks, the
 The backend records reminders sent and phrases said aloud itself. The app reports the rest with `POST /api/activity`, where `kind` is `reminder_opened` or `today_viewed`, or `phrase_heard` or `phrase_translated` with the phrase's id.
 
 `npm run users -- stats` shows each user's last 4 weeks, from Monday, one line a week: the days a reminder reached a device, the days the user opened the app from it, the days they looked at Today, and how many different phrases they practiced. Add a number for more weeks, up to 52, such as `npm run users -- stats 12`. The notification shows the phrases themselves, so someone can read them without opening the app: the days opened are the least they read, not all of it.
+
+## Admin
+
+The app's Admin tab, for the admin only, reads `/api/admin/*` to look after the app as it grows.
+
+**AI services.** Groq's and MyMemory's free plans have daily limits shared by the whole account, so every request the backend makes to them is counted on its UTC day in `ai_usage`: calls, failures, the ones refused for a limit, and what they used (tokens for Groq's chat model, seconds of audio for its speech model, characters for MyMemory). The providers take a `fetch`, and `server.ts` hands them one that counts (`src/meter.ts`); counting happens after the answer is passed on, and a failure to count is only logged. Groq's answers say how many requests its daily quota allows and has left, in rate-limit headers, and `ai_quota` keeps the latest. MyMemory doesn't say, so its limit is the documented 5,000 characters a day, or 50,000 with `MYMEMORY_EMAIL`.
+
+**Users.** Each user's sign-up date, last activity, phrases, devices with reminders, open sessions, and what they used today. The admin can log a user out of every device, as when they lose a phone, without touching their data.
+
+**System.** The reminder cron saves each run in `cron_runs`, kept 30 days: how many users, devices and deliveries it had, how many gone devices it removed, its errors and the first one's message, and the commit it ran. The admin sees when it last ran, its runs and failed runs in the last day, deliveries by day, the database's size and its biggest tables, and which commit the web service and the cron run, from Railway's `RAILWAY_GIT_COMMIT_SHA`.
 
 ## Import your current file
 

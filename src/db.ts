@@ -880,3 +880,92 @@ export async function cronRunsSince(db: Db, since: Date): Promise<CronRun[]> {
   );
   return rows;
 }
+
+/** A user as the admin sees them. */
+export interface AdminUser {
+  id: number;
+  email: string;
+  isAdmin: boolean;
+  createdAt: Date;
+  /** The latest thing the user did: a session renewed or opened, a phrase saved, or something practiced. Null if nothing yet. */
+  lastActiveAt: Date | null;
+  phrases: number;
+  /** Devices with reminders turned on. */
+  devices: number;
+  /** Sessions that haven't expired, one per device logged in. */
+  sessions: number;
+  remindersOn: boolean;
+  timeZone: string;
+  /** Each daily counter's day and count, as saved: the count is today's only when its day is the user's today. */
+  counters: Record<DailyCounter, { day: string | null; used: number }>;
+}
+
+export async function listUsersForAdmin(db: Db): Promise<AdminUser[]> {
+  const { rows } = await db.query(`
+    SELECT u.id, u.email, u.is_admin AS "isAdmin", u.created_at AS "createdAt",
+      u.reminders_on AS "remindersOn", u.time_zone AS "timeZone",
+      u.translations_day, u.translations_used, u.suggestions_day, u.suggestions_used,
+      u.pronunciations_day, u.pronunciations_used,
+      (SELECT count(*)::int FROM phrases p WHERE p.user_id = u.id) AS phrases,
+      (SELECT count(*)::int FROM push_subscriptions s WHERE s.user_id = u.id) AS devices,
+      (SELECT count(*)::int FROM sessions s WHERE s.user_id = u.id AND s.expires_at > now()) AS sessions,
+      -- GREATEST skips NULLs. A reminder sent is the cron's doing, not the user's.
+      GREATEST(
+        (SELECT max(a.created_at) FROM activity a WHERE a.user_id = u.id AND a.kind <> 'reminder_sent'),
+        (SELECT max(COALESCE(s.rotated_at, s.created_at)) FROM sessions s WHERE s.user_id = u.id),
+        (SELECT max(p.created_at) FROM phrases p WHERE p.user_id = u.id)
+      ) AS "lastActiveAt"
+    FROM users u
+    ORDER BY u.id
+  `);
+  return rows.map(({ translations_day, translations_used, suggestions_day, suggestions_used, pronunciations_day, pronunciations_used, ...user }) => ({
+    ...user,
+    counters: {
+      translations: { day: translations_day, used: translations_used },
+      suggestions: { day: suggestions_day, used: suggestions_used },
+      pronunciations: { day: pronunciations_day, used: pronunciations_used },
+    },
+  }));
+}
+
+/** The tables the admin sees the size of: the ones that grow with use. */
+const WATCHED_TABLES = ['phrases', 'activity', 'sessions', 'users', 'push_subscriptions', 'cron_runs', 'ai_usage', 'invites'] as const;
+
+/** The database's size on disk, and each watched table's rows and size, indexes included. */
+export async function databaseStats(db: Db): Promise<{ bytes: number; tables: { name: string; rows: number; bytes: number }[] }> {
+  const { rows } = await db.query('SELECT pg_database_size(current_database()) AS bytes');
+  const tables = [];
+  for (const name of WATCHED_TABLES) {
+    // Fixed names, never user input, so they can go into the SQL.
+    const { rows: [table] } = await db.query(
+      `SELECT count(*)::int AS rows, pg_total_relation_size('${name}') AS bytes FROM ${name}`,
+    );
+    tables.push({ name, rows: table.rows, bytes: Number(table.bytes) });
+  }
+  return { bytes: Number(rows[0].bytes), tables };
+}
+
+/** Reminders delivered on each of the last `days` UTC days, today included, oldest first; days without runs give 0. */
+export async function deliveriesByDay(db: Db, days: number, now = new Date()): Promise<{ day: string; delivered: number }[]> {
+  const { rows } = await db.query(
+    `SELECT to_char(d, 'YYYY-MM-DD') AS day,
+       COALESCE((SELECT sum(delivered)::int FROM cron_runs r WHERE (r.started_at AT TIME ZONE 'UTC')::date = d), 0) AS delivered
+     FROM generate_series($1::date - ($2::int - 1), $1::date, interval '1 day') AS d
+     ORDER BY d`,
+    [now.toISOString().slice(0, 10), days],
+  );
+  return rows;
+}
+
+/** Users with daily limits (all but the admin), and the average phrase's length, for the admin's worst-case estimates. */
+export async function capacityFacts(db: Db): Promise<{ limitedUsers: number; averagePhraseLength: number; remindersOn: number; devices: number }> {
+  const { rows } = await db.query(`
+    SELECT
+      (SELECT count(*)::int FROM users WHERE NOT is_admin) AS "limitedUsers",
+      (SELECT COALESCE(round(avg(length(text))), 0)::int FROM phrases) AS "averagePhraseLength",
+      (SELECT count(*)::int FROM users u WHERE u.reminders_on
+         AND EXISTS (SELECT 1 FROM push_subscriptions s WHERE s.user_id = u.id)) AS "remindersOn",
+      (SELECT count(*)::int FROM push_subscriptions) AS devices
+  `);
+  return rows[0];
+}

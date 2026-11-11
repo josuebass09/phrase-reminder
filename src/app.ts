@@ -12,7 +12,14 @@ import {
 } from './auth.js';
 import {
   addPhrase,
+  AI_SERVICES,
+  aiQuotas,
+  aiUsageSince,
+  capacityFacts,
   claimInvite,
+  cronRunsSince,
+  databaseStats,
+  deliveriesByDay,
   createInvite,
   createSession,
   createUser,
@@ -31,6 +38,7 @@ import {
   isValidEmail,
   listRecent,
   listToday,
+  listUsersForAdmin,
   recordActivity,
   MAX_PHRASE_LENGTH,
   MAX_TRANSLATION_LENGTH,
@@ -77,6 +85,10 @@ export interface AppConfig {
   pronounce?: Pronouncer;
   /** Pronunciation scores each user may ask for per local day. The admin has no limit. */
   pronunciationsPerDay?: number;
+  /** MyMemory's free characters a day for this server: about 5,000, or 50,000 with a contact email. */
+  mymemoryCharsPerDay?: number;
+  /** The commit running, from Railway, for the admin to tell which version is deployed. */
+  version?: string | null;
 }
 
 export const DEFAULT_TRANSLATIONS_PER_DAY = 30;
@@ -86,6 +98,21 @@ export const DEFAULT_SUGGESTIONS_PER_DAY = 20;
 // which shares the chat model's free limit with suggestions: 20 users at 20 a day of each
 // stay under its 1,000 a day.
 export const DEFAULT_PRONUNCIATIONS_PER_DAY = 20;
+
+/** MyMemory's free daily characters without a contact email (https://mymemory.translated.net/doc/usagelimits.php). */
+export const MYMEMORY_FREE_CHARS_PER_DAY = 5_000;
+/** With a contact email. */
+export const MYMEMORY_EMAIL_CHARS_PER_DAY = 50_000;
+
+/** Days of AI requests the admin sees. */
+const AI_HISTORY_DAYS = 30;
+
+/** The last `days` UTC days, today included, oldest first, as YYYY-MM-DD. */
+function lastUtcDays(days: number, now: Date): string[] {
+  return Array.from({ length: days }, (_, index) =>
+    new Date(now.getTime() - (days - 1 - index) * 86_400_000).toISOString().slice(0, 10),
+  );
+}
 
 /** Big enough to never stop anyone, for the admin, whose translations are still counted. */
 const NO_LIMIT = 2_147_483_647;
@@ -194,6 +221,8 @@ export function createApp({
   suggestionsPerDay = DEFAULT_SUGGESTIONS_PER_DAY,
   pronounce,
   pronunciationsPerDay = DEFAULT_PRONUNCIATIONS_PER_DAY,
+  mymemoryCharsPerDay = MYMEMORY_FREE_CHARS_PER_DAY,
+  version = null,
 }: AppConfig): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
   const perDay: Record<DailyCounter, number> = {
@@ -248,6 +277,12 @@ export function createApp({
         : await findUserInSession(db, claims.userId, claims.sessionId);
     if (!user) return c.json({ error: say(c).notLoggedIn }, 401);
     c.set('user', user);
+    await next();
+  });
+
+  /** After requireUser: only the admin goes on. */
+  const requireAdmin = createMiddleware<AppEnv>(async (c, next) => {
+    if (!c.get('user').isAdmin) return c.json({ error: say(c).onlyAdmin }, 403);
     await next();
   });
 
@@ -374,6 +409,88 @@ export function createApp({
       translations: await usage('translations'),
       suggestions: await usage('suggestions'),
       pronunciations: await usage('pronunciations'),
+    });
+  });
+
+  // The admin's view of the AI services: each day's requests for the last 30 UTC days, what's
+  // left of Groq's daily quotas, and what's needed to estimate the worst case with every user's limits.
+  app.get('/api/admin/ai', requireUser, requireAdmin, async (c) => {
+    const now = new Date();
+    const history = lastUtcDays(AI_HISTORY_DAYS, now).map((day) => ({
+      day,
+      ...Object.fromEntries(AI_SERVICES.map((service) => [service, { calls: 0, failures: 0, rateLimited: 0, units: 0 }])),
+    })) as ({ day: string } & Record<string, { calls: number; failures: number; rateLimited: number; units: number }>)[];
+    for (const { day, service, ...counts } of await aiUsageSince(db, AI_HISTORY_DAYS, now)) {
+      const entry = history.find((each) => each.day === day);
+      if (entry) entry[service] = counts;
+    }
+    const quotas = Object.fromEntries((await aiQuotas(db)).map(({ service, ...quota }) => [service, quota]));
+    const { limitedUsers, averagePhraseLength } = await capacityFacts(db);
+    return c.json({
+      history,
+      quotas: { groq_chat: quotas.groq_chat ?? null, groq_speech: quotas.groq_speech ?? null },
+      mymemoryCharsPerDay,
+      available: { groq: Boolean(suggest || pronounce), mymemory: Boolean(translate) },
+      perUserPerDay: { suggestions: suggestionsPerDay, translations: translationsPerDay, pronunciations: pronunciationsPerDay },
+      limitedUsers,
+      averagePhraseLength,
+    });
+  });
+
+  // Every user, with what the admin needs to look after them: activity, devices, sessions, and today's usage.
+  app.get('/api/admin/users', requireUser, requireAdmin, async (c) => {
+    const now = new Date();
+    const users = await listUsersForAdmin(db);
+    return c.json(
+      users.map(({ counters, timeZone, ...user }) => {
+        let today: string;
+        try {
+          today = localClock(now, timeZone).day;
+        } catch {
+          today = localClock(now, 'UTC').day;
+        }
+        const usedToday = (counter: DailyCounter) => (counters[counter].day === today ? counters[counter].used : 0);
+        return {
+          ...user,
+          today: {
+            suggestions: usedToday('suggestions'),
+            translations: usedToday('translations'),
+            pronunciations: usedToday('pronunciations'),
+          },
+        };
+      }),
+    );
+  });
+
+  // Logs a user out of every device, as when they're locked out or lose a phone. Their data stays.
+  app.delete('/api/admin/users/:id/sessions', requireUser, requireAdmin, async (c) => {
+    const m = say(c);
+    const id = parsePhraseId(c.req.param('id')); // Same shape as a phrase's id.
+    if (id === null || !(await findUser(db, id))) return c.json({ error: m.userNotFound }, 404);
+    if (id === c.get('user').id) return c.json({ error: m.endOwnSessionsInSettings }, 400);
+    return c.json({ ended: await endUserSessions(db, id) });
+  });
+
+  // The system's health: the reminder cron's runs and deliveries, the database's size, and the deployed versions.
+  app.get('/api/admin/system', requireUser, requireAdmin, async (c) => {
+    const now = new Date();
+    const dayAgo = new Date(now.getTime() - 86_400_000);
+    const runs = await cronRunsSince(db, new Date(now.getTime() - 7 * 86_400_000));
+    const lastDay = runs.filter((run) => run.startedAt >= dayAgo);
+    const failed = runs.find((run) => run.errors > 0);
+    const { remindersOn, devices } = await capacityFacts(db);
+    return c.json({
+      cron: {
+        lastRunAt: runs[0]?.startedAt ?? null,
+        runsLastDay: lastDay.length,
+        failedRunsLastDay: lastDay.filter((run) => run.errors > 0).length,
+        lastError: failed ? { at: failed.startedAt, message: failed.firstError } : null,
+        removedLastWeek: runs.reduce((sum, run) => sum + run.removed, 0),
+        deliveries: await deliveriesByDay(db, 7, now),
+      },
+      reminders: { usersOn: remindersOn, devices },
+      database: await databaseStats(db),
+      versions: { api: version, cron: runs[0]?.version ?? null },
     });
   });
 
