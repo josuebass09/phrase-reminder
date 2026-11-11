@@ -19,9 +19,9 @@ function dailyLimit(name: string, fallback: number): number {
   return fallback;
 }
 
-// Optional. Without a key, the chat answers that it isn't available.
+// Optional. Without a key, asking for suggestions answers that they aren't available.
 const groqKey = process.env.GROQ_API_KEY;
-if (!groqKey) console.warn('GROQ_API_KEY is not set, so the chat is off');
+if (!groqKey) console.warn('GROQ_API_KEY is not set, so suggestions are off');
 
 const db = connect(requireEnv('DATABASE_URL'));
 await ensureSchema(db);

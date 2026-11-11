@@ -51,9 +51,9 @@ export interface AppConfig {
   translate?: Translator;
   /** New translations each user may ask for per local day. The admin has no limit. */
   translationsPerDay?: number;
-  /** Gives the chat's formal and informal options. Without it, the chat gets a 503. */
+  /** Gives the formal and informal ways to say a new phrase. Without it, suggestions get a 503. */
   suggest?: Suggester;
-  /** Chat requests each user may make per local day. The admin has no limit. */
+  /** Suggestions each user may ask for per local day. The admin has no limit. */
   suggestionsPerDay?: number;
 }
 
@@ -302,7 +302,7 @@ export function createApp({
     const body = await c.req.json().catch(() => null);
     const text = phraseTextOf(body);
     if (!text) return c.json(INVALID_TEXT, 400);
-    // Optional. A phrase picked in the chat comes with its Spanish, so translating it later is free.
+    // Optional. A suggested phrase comes with its Spanish, so translating it later is free.
     const translation = body.translation ?? null;
     if (translation !== null && (typeof translation !== 'string' || translation.length > MAX_TRANSLATION_LENGTH)) {
       return c.json(INVALID_TRANSLATION, 400);
@@ -355,7 +355,7 @@ export function createApp({
     return c.json({ translation });
   });
 
-  // A formal and an informal way to say something in English. Nothing is saved
+  // A formal and an informal way to say a new phrase in English. Nothing is saved
   // until the user picks one, which the app then saves as a phrase.
   app.post('/api/suggestions', requireUser, async (c) => {
     const body = await c.req.json().catch(() => null);
@@ -364,11 +364,11 @@ export function createApp({
     // Optional: who it's for, where, or what it's about, so the options fit the situation.
     const context = body.context ?? '';
     if (typeof context !== 'string' || context.length > MAX_CONTEXT_LENGTH) return c.json(INVALID_CONTEXT, 400);
-    if (!suggest) return c.json({ error: "The chat isn't available" }, 503);
+    if (!suggest) return c.json({ error: "Suggestions aren't available right now" }, 503);
 
     const user = c.get('user');
     const day = await reserve(user, 'suggestions');
-    if (!day) return c.json({ error: `You've used today's ${suggestionsPerDay} chat answers. More tomorrow.` }, 429);
+    if (!day) return c.json({ error: `You've used today's ${suggestionsPerDay} suggestions. More tomorrow.` }, 429);
 
     try {
       return c.json(await suggest(text, context.trim() || undefined));

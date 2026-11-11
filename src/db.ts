@@ -103,7 +103,7 @@ export async function ensureSchema(db: Db): Promise<void> {
   // New translations used on the user's local day, for the daily limit.
   await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS translations_day TEXT');
   await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS translations_used INTEGER NOT NULL DEFAULT 0');
-  // The same for the chat's suggestions, which have their own limit.
+  // The same for suggestions of how to say a phrase, which have their own limit.
   await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS suggestions_day TEXT');
   await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS suggestions_used INTEGER NOT NULL DEFAULT 0');
   // Only a hash of each code is kept, so reading the table doesn't give working invites.
@@ -290,7 +290,7 @@ export async function listReminderCandidates(db: Db): Promise<ReminderCandidate[
   return rows;
 }
 
-/** What each user may do only so many times a day: new translations, and the chat's suggestions. */
+/** What each user may do only so many times a day: new translations, and suggestions. */
 export type DailyCounter = 'translations' | 'suggestions';
 
 // Fixed column names, never user input, so they can go into the SQL.
@@ -378,7 +378,7 @@ export async function deleteSubscription(db: Db, endpoint: string): Promise<void
   await db.query('DELETE FROM push_subscriptions WHERE endpoint = $1', [endpoint]);
 }
 
-/** The translation is optional: one picked in the chat comes with its Spanish already. */
+/** The translation is optional: a suggested phrase comes with its Spanish already. */
 export async function addPhrase(db: Db, userId: number, text: string, translation: string | null = null): Promise<Phrase> {
   const { rows } = await db.query(
     `INSERT INTO phrases (user_id, text, translation_es) VALUES ($1, $2, $3) RETURNING ${PHRASE_COLUMNS}`,

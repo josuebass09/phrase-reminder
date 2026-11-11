@@ -584,7 +584,7 @@ describe('POST /api/suggestions', () => {
     const response = await ask(appWith(), bob, { text: 'Hola' });
 
     expect(response.status).toBe(503);
-    expect(await response.json()).toEqual({ error: "The chat isn't available" });
+    expect(await response.json()).toEqual({ error: "Suggestions aren't available right now" });
   });
 
   it('answers 502 and does not count it when the AI fails', async () => {
@@ -608,7 +608,7 @@ describe('POST /api/suggestions', () => {
 
     expect(statuses).toEqual([200, 200]);
     expect(third.status).toBe(429);
-    expect(await third.json()).toEqual({ error: "You've used today's 2 chat answers. More tomorrow." });
+    expect(await third.json()).toEqual({ error: "You've used today's 2 suggestions. More tomorrow." });
     expect(counts).toEqual({ translations: { used: 0, limit: 30 }, suggestions: { used: 2, limit: 2 } });
     expect((await ask(target, alice, { text: 'uno' })).status).toBe(200);
   });
