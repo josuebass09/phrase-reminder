@@ -34,7 +34,7 @@ Railway deploys from this repository, so push it to GitHub first. All settings b
 3. Add a **web service** from this repository:
    - Build command: `npm run build`
    - Start command: `npm start`
-   - Variables: `DATABASE_URL` (reference the Postgres service), `SESSION_SECRET`, `VAPID_PUBLIC_KEY`, `APP_ORIGIN` once the app has a domain, and optionally `MYMEMORY_EMAIL` (see Translations)
+   - Variables: `DATABASE_URL` (reference the Postgres service), `SESSION_SECRET`, `VAPID_PUBLIC_KEY`, `APP_ORIGIN` once the app has a domain, and optionally `MYMEMORY_EMAIL` (see Translations) and `GROQ_API_KEY` (see Chat)
    - Generate a public domain under Networking.
 4. Add a **cron service** from the same repository:
    - Build command: `npm run build`
@@ -89,11 +89,12 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `PATCH /api/settings` with any of those | Yes | All the settings after the change, or 400 with what's wrong. `reminderTime` is 24-hour `HH:MM`, `timeZone` an IANA zone such as `America/Costa_Rica`, and `phrasesPerDay` 1 to 5 |
 | `GET /api/phrases` | Yes | The user's 50 newest phrases |
 | `GET /api/today` | Yes | The phrases from the user's latest reminder |
-| `POST /api/phrases` with `{ text }` | Yes | The saved phrase, 201 |
+| `POST /api/phrases` with `{ text }`, and optionally `translation` | Yes | The saved phrase, 201. A `translation` (Spanish, up to 1,000 characters) is saved as the phrase's translation |
 | `PATCH /api/phrases/:id` with `{ text }` | Yes | The updated phrase, or 404 |
 | `DELETE /api/phrases/:id` | Yes | 204, or 404 |
 | `GET /api/phrases/:id/translation` | Yes | `{ translation }` in Spanish, or 404. 429 once the user's new translations for the day are used up, and 502 if the translation service fails |
-| `GET /api/translation-usage` | Yes | `{ used, limit }`: new translations today, and the daily limit (`null` for the admin) |
+| `POST /api/suggestions` with `{ text }`, and optionally `context` | Yes | `{ formal, informal }`, each `{ text, es }`: two ways to say the text in English, with their Spanish. `context` (up to 300 characters) says who it's for, where, or what it's about, so the options fit. Saves nothing. 429 once the user's chat answers for the day are used up, 502 if the AI fails, 503 without `GROQ_API_KEY` |
+| `GET /api/usage` | Yes | `{ translations, suggestions }`, each `{ used, limit }`: what the user has used today, and the daily limit (`null` for the admin) |
 | `POST /api/push/subscribe` with a `PushSubscription` | Yes | 204 |
 
 Send the token as `Authorization: Bearer <token>`. It's a JWT signed with `SESSION_SECRET`, and `expiresIn` is its lifetime in seconds (43200). Without a valid token, these requests get a 401. Phrases look like `{ id, text, createdAt }`. Another user's phrase gets the same 404 as a missing one.
@@ -105,6 +106,12 @@ The app can show each phrase in Spanish. The backend asks [MyMemory](https://mym
 MyMemory's free limit is about 5,000 characters a day per server. Set `MYMEMORY_EMAIL` on the web service to a contact email to raise it to about 50,000. When the limit runs out, the app says it couldn't translate, and the phrase can be translated the next day.
 
 So one person can't use up that shared limit, each user may ask for 30 new translations a day, counted on their local day from their settings' time zone. Opening a saved translation doesn't count, a failed translation is given back, and the admin has no limit (their translations are still counted). Set `TRANSLATIONS_PER_DAY` on the web service to change the 30. With 20 users of about 55-character phrases, 30 each comes to at most about 33,000 characters a day, within the 50,000 with room to spare. Settings in the app shows each user how many they've used today.
+
+## Chat
+
+The app's Chat tab takes something the user wants to say, in Spanish or English, and shows a formal and an informal way to say it in English, each with its Spanish. An optional context, such as "Slack message to my manager about a late deploy", helps the AI fit the words and tone to the situation. Saving one adds it as a phrase with that Spanish as its translation, so translating it later is free.
+
+The backend asks `openai/gpt-oss-120b` on [Groq](https://console.groq.com/), whose free plan needs no card. Create a key under API Keys and set it as `GROQ_API_KEY` on the web service; `GROQ_MODEL` picks another model. The free plan allows about 1,000 requests a day and 30 a minute for the whole account (see [rate limits](https://console.groq.com/docs/rate-limits)), so each user may ask for 20 answers a day, counted like translations: on their local day, a failed answer is given back, and the admin has no limit. Set `SUGGESTIONS_PER_DAY` to change the 20. With 20 users, that's at most 400 requests a day. What users type is sent to Groq.
 
 ## Import your current file
 

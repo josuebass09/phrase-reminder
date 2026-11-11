@@ -1,6 +1,8 @@
 import pg from 'pg';
 
 export const MAX_PHRASE_LENGTH = 500;
+/** A Spanish translation can run longer than its English phrase. */
+export const MAX_TRANSLATION_LENGTH = 1000;
 
 export interface Db {
   query(sql: string, params?: unknown[]): Promise<{ rows: any[] }>;
@@ -101,6 +103,9 @@ export async function ensureSchema(db: Db): Promise<void> {
   // New translations used on the user's local day, for the daily limit.
   await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS translations_day TEXT');
   await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS translations_used INTEGER NOT NULL DEFAULT 0');
+  // The same for the chat's suggestions, which have their own limit.
+  await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS suggestions_day TEXT');
+  await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS suggestions_used INTEGER NOT NULL DEFAULT 0');
   // Only a hash of each code is kept, so reading the table doesn't give working invites.
   await db.query(`
     CREATE TABLE IF NOT EXISTS invites (
@@ -285,34 +290,52 @@ export async function listReminderCandidates(db: Db): Promise<ReminderCandidate[
   return rows;
 }
 
+/** What each user may do only so many times a day: new translations, and the chat's suggestions. */
+export type DailyCounter = 'translations' | 'suggestions';
+
+// Fixed column names, never user input, so they can go into the SQL.
+const COUNTER_COLUMNS: Record<DailyCounter, { day: string; used: string }> = {
+  translations: { day: 'translations_day', used: 'translations_used' },
+  suggestions: { day: 'suggestions_day', used: 'suggestions_used' },
+};
+
 /**
- * Counts one new translation for the user on their local day, unless that would
- * pass the limit. Returns false if they've reached it. A new day starts the count over.
+ * Counts one use for the user on their local day, unless that would pass the
+ * limit. Returns false if they've reached it. A new day starts the count over.
  */
-export async function reserveTranslation(db: Db, userId: number, day: string, limit: number): Promise<boolean> {
+export async function reserveDailyUse(
+  db: Db,
+  userId: number,
+  counter: DailyCounter,
+  day: string,
+  limit: number,
+): Promise<boolean> {
+  const { day: dayColumn, used } = COUNTER_COLUMNS[counter];
   const { rows } = await db.query(
     `UPDATE users
-     SET translations_used = CASE WHEN translations_day = $2 THEN translations_used + 1 ELSE 1 END,
-         translations_day = $2
-     WHERE id = $1 AND (translations_day IS DISTINCT FROM $2 OR translations_used < $3)
+     SET ${used} = CASE WHEN ${dayColumn} = $2 THEN ${used} + 1 ELSE 1 END,
+         ${dayColumn} = $2
+     WHERE id = $1 AND (${dayColumn} IS DISTINCT FROM $2 OR ${used} < $3)
      RETURNING id`,
     [userId, day, limit],
   );
   return rows.length > 0;
 }
 
-/** Gives back a reserved translation that didn't happen, such as when the service failed. */
-export async function releaseTranslation(db: Db, userId: number, day: string): Promise<void> {
-  await db.query(
-    'UPDATE users SET translations_used = GREATEST(translations_used - 1, 0) WHERE id = $1 AND translations_day = $2',
-    [userId, day],
-  );
+/** Gives back a reserved use that didn't happen, such as when the service failed. */
+export async function releaseDailyUse(db: Db, userId: number, counter: DailyCounter, day: string): Promise<void> {
+  const { day: dayColumn, used } = COUNTER_COLUMNS[counter];
+  await db.query(`UPDATE users SET ${used} = GREATEST(${used} - 1, 0) WHERE id = $1 AND ${dayColumn} = $2`, [
+    userId,
+    day,
+  ]);
 }
 
-/** New translations the user has used on their local day. */
-export async function translationsUsed(db: Db, userId: number, day: string): Promise<number> {
+/** Uses the user has had on their local day. */
+export async function dailyUses(db: Db, userId: number, counter: DailyCounter, day: string): Promise<number> {
+  const { day: dayColumn, used } = COUNTER_COLUMNS[counter];
   const { rows } = await db.query(
-    'SELECT CASE WHEN translations_day = $2 THEN translations_used ELSE 0 END AS used FROM users WHERE id = $1',
+    `SELECT CASE WHEN ${dayColumn} = $2 THEN ${used} ELSE 0 END AS used FROM users WHERE id = $1`,
     [userId, day],
   );
   return rows[0]?.used ?? 0;
@@ -355,10 +378,11 @@ export async function deleteSubscription(db: Db, endpoint: string): Promise<void
   await db.query('DELETE FROM push_subscriptions WHERE endpoint = $1', [endpoint]);
 }
 
-export async function addPhrase(db: Db, userId: number, text: string): Promise<Phrase> {
+/** The translation is optional: one picked in the chat comes with its Spanish already. */
+export async function addPhrase(db: Db, userId: number, text: string, translation: string | null = null): Promise<Phrase> {
   const { rows } = await db.query(
-    `INSERT INTO phrases (user_id, text) VALUES ($1, $2) RETURNING ${PHRASE_COLUMNS}`,
-    [userId, text],
+    `INSERT INTO phrases (user_id, text, translation_es) VALUES ($1, $2, $3) RETURNING ${PHRASE_COLUMNS}`,
+    [userId, text, translation],
   );
   return rows[0];
 }

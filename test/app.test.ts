@@ -189,6 +189,33 @@ describe('POST /api/phrases', () => {
     expect(response.status).toBe(400);
     expect(await listRecent(db, alice.id)).toEqual([]);
   });
+
+  it('saves a translation sent with the phrase, so translating it later is free', async () => {
+    const translate = vi.fn(async () => 'should not be called');
+    const target = createApp({ db, tokenSecret: SECRET, vapidPublicKey: 'k', translate });
+    const response = await requestAs(alice, '/api/phrases', {
+      method: 'POST',
+      body: JSON.stringify({ text: 'Could you take a look?', translation: ' ¿Podrías revisarlo? ' }),
+    });
+    const { id } = await response.json();
+
+    const translation = await target.request(`/api/phrases/${id}/translation`, { headers: { Authorization: await bearer(alice) } });
+
+    expect(response.status).toBe(201);
+    expect(await translation.json()).toEqual({ translation: '¿Podrías revisarlo?' });
+    expect(translate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a non-string translation', { text: 'Hello.', translation: 42 }],
+    ['a translation over the limit', { text: 'Hello.', translation: 'x'.repeat(1001) }],
+  ])('rejects %s and saves nothing', async (_name, body) => {
+    const response = await requestAs(alice, '/api/phrases', { method: 'POST', body: JSON.stringify(body) });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: 'Translation must be text of up to 1000 characters' });
+    expect(await listRecent(db, alice.id)).toEqual([]);
+  });
 });
 
 describe('GET /api/phrases', () => {
@@ -407,7 +434,7 @@ describe('GET /api/phrases/:id/translation', () => {
     const limited = (translate = vi.fn(async (text: string) => `es: ${text}`)) =>
       createApp({ db, tokenSecret: SECRET, vapidPublicKey: 'k', translate, translationsPerDay: 2 });
     const usage = async (target: ReturnType<typeof createApp>, user: User) =>
-      (await target.request('/api/translation-usage', { headers: { Authorization: await bearer(user) } })).json();
+      (await (await target.request('/api/usage', { headers: { Authorization: await bearer(user) } })).json()).translations;
 
     it('allows each user that many new translations a day, then answers 429', async () => {
       const target = limited();
@@ -474,6 +501,137 @@ describe('GET /api/phrases/:id/translation', () => {
     const phrase = await addPhrase(db, alice.id, 'Hello.');
 
     expect((await ask(appWith(), alice, phrase.id)).status).toBe(503);
+  });
+});
+
+describe('POST /api/suggestions', () => {
+  const OPTIONS = {
+    formal: { text: 'Could you please take a look?', es: '¿Podría revisarlo, por favor?' },
+    informal: { text: 'Can you take a look?', es: '¿Le echas un ojo?' },
+  };
+
+  function appWith(suggest?: (text: string) => Promise<typeof OPTIONS>, suggestionsPerDay?: number) {
+    return createApp({ db, tokenSecret: SECRET, vapidPublicKey: 'k', suggest, suggestionsPerDay });
+  }
+
+  async function ask(target: ReturnType<typeof createApp>, user: User | null, body: unknown) {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (user) headers.Authorization = await bearer(user);
+    const payload = typeof body === 'string' ? body : JSON.stringify(body);
+    return target.request('/api/suggestions', { method: 'POST', headers, body: payload });
+  }
+
+  const usage = async (target: ReturnType<typeof createApp>, user: User) =>
+    (await (await target.request('/api/usage', { headers: { Authorization: await bearer(user) } })).json()).suggestions;
+
+  it('gives a formal and an informal option for the trimmed text, and saves no phrase', async () => {
+    const suggest = vi.fn(async () => OPTIONS);
+
+    const response = await ask(appWith(suggest), bob, { text: '  ¿Puedes revisarlo?  ' });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(OPTIONS);
+    expect(suggest).toHaveBeenCalledWith('¿Puedes revisarlo?', undefined);
+    expect(await listRecent(db, bob.id)).toEqual([]);
+  });
+
+  it('passes the trimmed context to the AI, and none when it is blank', async () => {
+    const suggest = vi.fn(async () => OPTIONS);
+    const target = appWith(suggest);
+
+    await ask(target, bob, { text: 'Hola', context: '  Email to a client  ' });
+    await ask(target, bob, { text: 'Hola', context: '   ' });
+    await ask(target, bob, { text: 'Hola', context: null });
+
+    expect(suggest.mock.calls).toEqual([
+      ['Hola', 'Email to a client'],
+      ['Hola', undefined],
+      ['Hola', undefined],
+    ]);
+  });
+
+  it.each([
+    ['a non-string context', { text: 'Hola', context: 42 }],
+    ['a context over the limit', { text: 'Hola', context: 'x'.repeat(301) }],
+  ])('rejects %s without asking the AI', async (_name, body) => {
+    const suggest = vi.fn(async () => OPTIONS);
+
+    const response = await ask(appWith(suggest), bob, body);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: 'Context must be text of up to 300 characters' });
+    expect(suggest).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['blank text', { text: '  ' }],
+    ['text over the limit', { text: 'x'.repeat(MAX_PHRASE_LENGTH + 1) }],
+    ['invalid JSON', 'not json'],
+  ])('rejects %s without asking the AI or counting it', async (_name, body) => {
+    const suggest = vi.fn(async () => OPTIONS);
+    const target = appWith(suggest);
+
+    expect((await ask(target, bob, body)).status).toBe(400);
+    expect(suggest).not.toHaveBeenCalled();
+    expect(await usage(target, bob)).toEqual({ used: 0, limit: 20 });
+  });
+
+  it('requires a token', async () => {
+    expect((await ask(appWith(async () => OPTIONS), null, { text: 'Hola' })).status).toBe(401);
+  });
+
+  it('answers 503 when no AI is set up', async () => {
+    const response = await ask(appWith(), bob, { text: 'Hola' });
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "The chat isn't available" });
+  });
+
+  it('answers 502 and does not count it when the AI fails', async () => {
+    const target = appWith(vi.fn().mockRejectedValue(new Error('Groq answered HTTP 500')));
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const response = await ask(target, bob, { text: 'Hola' });
+    quiet.mockRestore();
+
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({ error: "Couldn't get an answer right now. Try again." });
+    expect(await usage(target, bob)).toEqual({ used: 0, limit: 20 });
+  });
+
+  it('allows each user that many a day, then answers 429, apart from translations', async () => {
+    const target = appWith(async () => OPTIONS, 2);
+
+    const statuses = [(await ask(target, bob, { text: 'uno' })).status, (await ask(target, bob, { text: 'dos' })).status];
+    const third = await ask(target, bob, { text: 'tres' });
+    const counts = await (await target.request('/api/usage', { headers: { Authorization: await bearer(bob) } })).json();
+
+    expect(statuses).toEqual([200, 200]);
+    expect(third.status).toBe(429);
+    expect(await third.json()).toEqual({ error: "You've used today's 2 chat answers. More tomorrow." });
+    expect(counts).toEqual({ translations: { used: 0, limit: 30 }, suggestions: { used: 2, limit: 2 } });
+    expect((await ask(target, alice, { text: 'uno' })).status).toBe(200);
+  });
+
+  it('does not limit the admin, but still counts', async () => {
+    const target = appWith(async () => OPTIONS, 1);
+
+    for (const text of ['uno', 'dos']) expect((await ask(target, alice, { text })).status).toBe(200);
+
+    expect(await usage(target, alice)).toEqual({ used: 2, limit: null });
+  });
+});
+
+describe('GET /api/usage', () => {
+  it('requires a token', async () => {
+    expect((await requestAs(null, '/api/usage')).status).toBe(401);
+  });
+
+  it('starts every user at zero, with the default limits', async () => {
+    expect(await (await requestAs(bob, '/api/usage')).json()).toEqual({
+      translations: { used: 0, limit: 30 },
+      suggestions: { used: 0, limit: 20 },
+    });
   });
 });
 

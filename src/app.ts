@@ -8,25 +8,27 @@ import {
   claimInvite,
   createInvite,
   createUser,
+  dailyUses,
   deletePhrase,
   findUser,
   findPhraseTranslation,
   findUserByEmail,
   finishInvite,
   getSettings,
-  releaseTranslation,
-  reserveTranslation,
-  translationsUsed,
   isInviteUsable,
   isValidEmail,
   listRecent,
   listToday,
   MAX_PHRASE_LENGTH,
+  MAX_TRANSLATION_LENGTH,
   normalizeEmail,
+  releaseDailyUse,
+  reserveDailyUse,
   saveSubscription,
   saveTranslation,
   updateSettings,
   updatePhrase,
+  type DailyCounter,
   type Db,
   type DeviceSubscription,
   type ReminderSettings,
@@ -35,6 +37,7 @@ import {
 import { hashInviteCode, INVITE_LIFETIME_DAYS, newInviteCode } from './invites.js';
 import { checkNewPassword, dummyHash, hashPassword, MAX_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
 import { isValidTime, isValidTimeZone, localClock, MAX_PHRASES_PER_DAY } from './schedule.js';
+import { MAX_CONTEXT_LENGTH, type Suggester } from './suggest.js';
 import type { Translator } from './translate.js';
 
 export interface AppConfig {
@@ -48,9 +51,15 @@ export interface AppConfig {
   translate?: Translator;
   /** New translations each user may ask for per local day. The admin has no limit. */
   translationsPerDay?: number;
+  /** Gives the chat's formal and informal options. Without it, the chat gets a 503. */
+  suggest?: Suggester;
+  /** Chat requests each user may make per local day. The admin has no limit. */
+  suggestionsPerDay?: number;
 }
 
 export const DEFAULT_TRANSLATIONS_PER_DAY = 30;
+// 20 users at 20 a day stay well inside the AI's free plan of about 1,000 requests a day.
+export const DEFAULT_SUGGESTIONS_PER_DAY = 20;
 
 /** Big enough to never stop anyone, for the admin, whose translations are still counted. */
 const NO_LIMIT = 2_147_483_647;
@@ -81,11 +90,14 @@ function parsePhraseId(value: string): number | null {
   return id >= 1 && id <= MAX_PHRASE_ID ? id : null;
 }
 
-/** Reads the trimmed phrase text from a JSON body, or null if it's missing or too long. */
-async function readPhraseText(c: Context): Promise<string | null> {
-  const body = await c.req.json().catch(() => null);
+/** The trimmed phrase text from a JSON body, or null if it's missing or too long. */
+function phraseTextOf(body: any): string | null {
   const text = typeof body?.text === 'string' ? body.text.trim() : '';
   return text && text.length <= MAX_PHRASE_LENGTH ? text : null;
+}
+
+async function readPhraseText(c: Context): Promise<string | null> {
+  return phraseTextOf(await c.req.json().catch(() => null));
 }
 
 /** Postgres refused a duplicate value, such as an email that two sign-ups claimed at once. */
@@ -125,6 +137,8 @@ function parseSettingsChanges(body: any): { changes: Partial<ReminderSettings> }
 }
 
 const INVALID_TEXT = { error: `Phrase must be 1 to ${MAX_PHRASE_LENGTH} characters` };
+const INVALID_TRANSLATION = { error: `Translation must be text of up to ${MAX_TRANSLATION_LENGTH} characters` };
+const INVALID_CONTEXT = { error: `Context must be text of up to ${MAX_CONTEXT_LENGTH} characters` };
 const NOT_FOUND = { error: 'Phrase not found' };
 const WRONG_LOGIN = { error: 'Wrong email or password' };
 const UNUSABLE_INVITE = { error: 'This invite is not valid, was already used, or has expired' };
@@ -137,13 +151,23 @@ export function createApp({
   appOrigins = [],
   translate,
   translationsPerDay = DEFAULT_TRANSLATIONS_PER_DAY,
+  suggest,
+  suggestionsPerDay = DEFAULT_SUGGESTIONS_PER_DAY,
 }: AppConfig): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
+  const perDay: Record<DailyCounter, number> = { translations: translationsPerDay, suggestions: suggestionsPerDay };
 
   /** The user's local day, from the time zone in their settings, for daily limits. */
   async function userDay(userId: number): Promise<string> {
     const settings = await getSettings(db, userId);
     return localClock(new Date(), settings?.timeZone ?? 'UTC').day;
+  }
+
+  /** Counts one use on the user's local day and returns that day, or null if they've reached the limit. */
+  async function reserve(user: User, counter: DailyCounter): Promise<string | null> {
+    const day = await userDay(user.id);
+    const limit = user.isAdmin ? NO_LIMIT : perDay[counter];
+    return (await reserveDailyUse(db, user.id, counter, day, limit)) ? day : null;
   }
 
   /** The body for a new session, the same after logging in and after signing up. */
@@ -250,11 +274,15 @@ export function createApp({
 
   app.get('/api/me', requireUser, (c) => c.json(c.get('user')));
 
-  // How many new translations the user has used today, and their limit (null for the admin).
-  app.get('/api/translation-usage', requireUser, async (c) => {
+  // What the user has used of each daily limit today, and the limit (null for the admin).
+  app.get('/api/usage', requireUser, async (c) => {
     const user = c.get('user');
-    const used = await translationsUsed(db, user.id, await userDay(user.id));
-    return c.json({ used, limit: user.isAdmin ? null : translationsPerDay });
+    const day = await userDay(user.id);
+    const usage = async (counter: DailyCounter) => ({
+      used: await dailyUses(db, user.id, counter, day),
+      limit: user.isAdmin ? null : perDay[counter],
+    });
+    return c.json({ translations: await usage('translations'), suggestions: await usage('suggestions') });
   });
 
   app.get('/api/settings', requireUser, async (c) => c.json(await getSettings(db, c.get('user').id)));
@@ -271,10 +299,16 @@ export function createApp({
   app.get('/api/today', requireUser, async (c) => c.json(await listToday(db, c.get('user').id)));
 
   app.post('/api/phrases', requireUser, async (c) => {
-    const text = await readPhraseText(c);
+    const body = await c.req.json().catch(() => null);
+    const text = phraseTextOf(body);
     if (!text) return c.json(INVALID_TEXT, 400);
+    // Optional. A phrase picked in the chat comes with its Spanish, so translating it later is free.
+    const translation = body.translation ?? null;
+    if (translation !== null && (typeof translation !== 'string' || translation.length > MAX_TRANSLATION_LENGTH)) {
+      return c.json(INVALID_TRANSLATION, 400);
+    }
 
-    return c.json(await addPhrase(db, c.get('user').id, text), 201);
+    return c.json(await addPhrase(db, c.get('user').id, text, translation?.trim() || null), 201);
   });
 
   // Another user's phrase gets the same 404 as a missing one, so ids reveal nothing.
@@ -306,23 +340,43 @@ export function createApp({
     if (!translate) return c.json({ error: "Translation isn't available" }, 503);
 
     // Only new translations count toward the daily limit; saved ones above are free.
-    const user = c.get('user');
-    const day = await userDay(userId);
-    const limit = user.isAdmin ? NO_LIMIT : translationsPerDay;
-    if (!(await reserveTranslation(db, userId, day, limit))) {
-      return c.json({ error: `You've used today's ${translationsPerDay} translations. More tomorrow.` }, 429);
-    }
+    const day = await reserve(c.get('user'), 'translations');
+    if (!day) return c.json({ error: `You've used today's ${translationsPerDay} translations. More tomorrow.` }, 429);
 
     let translation: string;
     try {
       translation = await translate(phrase.text);
     } catch (error) {
-      await releaseTranslation(db, userId, day);
+      await releaseDailyUse(db, userId, 'translations', day);
       console.error('Translation failed:', error);
       return c.json({ error: "Couldn't translate right now" }, 502);
     }
     await saveTranslation(db, userId, id, phrase.text, translation);
     return c.json({ translation });
+  });
+
+  // A formal and an informal way to say something in English. Nothing is saved
+  // until the user picks one, which the app then saves as a phrase.
+  app.post('/api/suggestions', requireUser, async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const text = phraseTextOf(body);
+    if (!text) return c.json(INVALID_TEXT, 400);
+    // Optional: who it's for, where, or what it's about, so the options fit the situation.
+    const context = body.context ?? '';
+    if (typeof context !== 'string' || context.length > MAX_CONTEXT_LENGTH) return c.json(INVALID_CONTEXT, 400);
+    if (!suggest) return c.json({ error: "The chat isn't available" }, 503);
+
+    const user = c.get('user');
+    const day = await reserve(user, 'suggestions');
+    if (!day) return c.json({ error: `You've used today's ${suggestionsPerDay} chat answers. More tomorrow.` }, 429);
+
+    try {
+      return c.json(await suggest(text, context.trim() || undefined));
+    } catch (error) {
+      await releaseDailyUse(db, user.id, 'suggestions', day);
+      console.error('Suggestions failed:', error);
+      return c.json({ error: "Couldn't get an answer right now. Try again." }, 502);
+    }
   });
 
   app.post('/api/push/subscribe', requireUser, async (c) => {

@@ -6,6 +6,7 @@ import {
   claimUnowned,
   createInvite,
   createUser,
+  dailyUses,
   deletePhrase,
   deleteSubscription,
   ensureSchema,
@@ -23,12 +24,11 @@ import {
   listUsers,
   markShown,
   pickDailyPhrases,
-  releaseTranslation,
-  reserveTranslation,
+  releaseDailyUse,
+  reserveDailyUse,
   saveSubscription,
   saveTranslation,
   setPasswordHash,
-  translationsUsed,
   updatePhrase,
   type Db,
   type User,
@@ -165,30 +165,43 @@ describe('invites', () => {
   });
 });
 
-describe('translation limits', () => {
+describe('daily limits', () => {
+  const reserve = (user: User, day: string, limit: number) => reserveDailyUse(db, user.id, 'translations', day, limit);
+  const used = (user: User, day: string) => dailyUses(db, user.id, 'translations', day);
+
   it('count up to the limit, per user and day', async () => {
-    expect(await reserveTranslation(db, bob.id, '2026-11-10', 2)).toBe(true);
-    expect(await reserveTranslation(db, bob.id, '2026-11-10', 2)).toBe(true);
-    expect(await reserveTranslation(db, bob.id, '2026-11-10', 2)).toBe(false);
-    expect(await translationsUsed(db, bob.id, '2026-11-10')).toBe(2);
-    expect(await translationsUsed(db, alice.id, '2026-11-10')).toBe(0);
+    expect(await reserve(bob, '2026-11-10', 2)).toBe(true);
+    expect(await reserve(bob, '2026-11-10', 2)).toBe(true);
+    expect(await reserve(bob, '2026-11-10', 2)).toBe(false);
+    expect(await used(bob, '2026-11-10')).toBe(2);
+    expect(await used(alice, '2026-11-10')).toBe(0);
   });
 
   it('start over on a new day', async () => {
-    await reserveTranslation(db, bob.id, '2026-11-10', 1);
+    await reserve(bob, '2026-11-10', 1);
 
-    expect(await reserveTranslation(db, bob.id, '2026-11-11', 1)).toBe(true);
-    expect(await translationsUsed(db, bob.id, '2026-11-11')).toBe(1);
-    expect(await translationsUsed(db, bob.id, '2026-11-12')).toBe(0);
+    expect(await reserve(bob, '2026-11-11', 1)).toBe(true);
+    expect(await used(bob, '2026-11-11')).toBe(1);
+    expect(await used(bob, '2026-11-12')).toBe(0);
   });
 
-  it('give back a translation that did not happen', async () => {
-    await reserveTranslation(db, bob.id, '2026-11-10', 1);
+  it('give back a use that did not happen', async () => {
+    await reserve(bob, '2026-11-10', 1);
 
-    await releaseTranslation(db, bob.id, '2026-11-10');
+    await releaseDailyUse(db, bob.id, 'translations', '2026-11-10');
 
-    expect(await translationsUsed(db, bob.id, '2026-11-10')).toBe(0);
-    expect(await reserveTranslation(db, bob.id, '2026-11-10', 1)).toBe(true);
+    expect(await used(bob, '2026-11-10')).toBe(0);
+    expect(await reserve(bob, '2026-11-10', 1)).toBe(true);
+  });
+
+  it('keep translations and suggestions apart', async () => {
+    await reserve(bob, '2026-11-10', 1);
+
+    expect(await reserveDailyUse(db, bob.id, 'suggestions', '2026-11-10', 1)).toBe(true);
+    expect(await reserveDailyUse(db, bob.id, 'suggestions', '2026-11-10', 1)).toBe(false);
+    await releaseDailyUse(db, bob.id, 'suggestions', '2026-11-10');
+    expect(await dailyUses(db, bob.id, 'suggestions', '2026-11-10')).toBe(0);
+    expect(await used(bob, '2026-11-10')).toBe(1);
   });
 });
 
@@ -296,6 +309,17 @@ describe('addPhrase', () => {
     expect(phrase.text).toBe('It slipped my mind.');
     expect(phrase.createdAt).toBeInstanceOf(Date);
     expect(await pickDailyPhrases(db, alice.id)).toEqual([]);
+  });
+
+  it('stores a translation that comes with the phrase, and none without one', async () => {
+    const picked = await addPhrase(db, alice.id, 'Could you take a look?', '¿Podrías revisarlo?');
+    const typed = await addPhrase(db, alice.id, 'Hello.');
+
+    expect(await findPhraseTranslation(db, alice.id, picked.id)).toEqual({
+      text: 'Could you take a look?',
+      translation: '¿Podrías revisarlo?',
+    });
+    expect((await findPhraseTranslation(db, alice.id, typed.id))?.translation).toBeNull();
   });
 });
 
