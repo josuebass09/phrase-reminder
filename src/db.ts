@@ -56,6 +56,8 @@ export interface Phrase {
   id: number;
   text: string;
   createdAt: Date;
+  /** The score of the last time the user said it aloud, from 1 to 10, or null if never. */
+  lastScore: number | null;
 }
 
 export interface DeviceSubscription {
@@ -64,7 +66,7 @@ export interface DeviceSubscription {
   auth: string;
 }
 
-const PHRASE_COLUMNS = 'id, text, created_at AS "createdAt"';
+const PHRASE_COLUMNS = 'id, text, created_at AS "createdAt", last_score AS "lastScore"';
 const USER_COLUMNS = 'id, email, is_admin AS "isAdmin"';
 const SETTINGS_COLUMNS =
   'reminders_on AS "remindersOn", reminder_time AS "reminderTime", time_zone AS "timeZone", phrases_per_day AS "phrasesPerDay", language';
@@ -112,6 +114,9 @@ export async function ensureSchema(db: Db): Promise<void> {
   // The same for suggestions of how to say a phrase, which have their own limit.
   await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS suggestions_day TEXT');
   await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS suggestions_used INTEGER NOT NULL DEFAULT 0');
+  // And for scoring how the user says a phrase aloud.
+  await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS pronunciations_day TEXT');
+  await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS pronunciations_used INTEGER NOT NULL DEFAULT 0');
   // Only a hash of each code is kept, so reading the table doesn't give working invites.
   await db.query(`
     CREATE TABLE IF NOT EXISTS invites (
@@ -152,6 +157,8 @@ export async function ensureSchema(db: Db): Promise<void> {
   // The Spanish translation, saved the first time someone asks, so each phrase is translated once.
   await db.query('ALTER TABLE phrases ADD COLUMN IF NOT EXISTS translation_es TEXT');
   await db.query('CREATE INDEX IF NOT EXISTS push_subscriptions_user_id ON push_subscriptions (user_id)');
+  // The score, from 1 to 10, of the last time the user said the phrase aloud. The recording isn't kept.
+  await db.query('ALTER TABLE phrases ADD COLUMN IF NOT EXISTS last_score SMALLINT');
 }
 
 /** Emails are compared trimmed and lowercased, so "Me@Example.com " finds me@example.com. */
@@ -297,13 +304,14 @@ export async function listReminderCandidates(db: Db): Promise<ReminderCandidate[
   return rows;
 }
 
-/** What each user may do only so many times a day: new translations, and suggestions. */
-export type DailyCounter = 'translations' | 'suggestions';
+/** What each user may do only so many times a day: new translations, suggestions, and pronunciation scores. */
+export type DailyCounter = 'translations' | 'suggestions' | 'pronunciations';
 
 // Fixed column names, never user input, so they can go into the SQL.
 const COUNTER_COLUMNS: Record<DailyCounter, { day: string; used: string }> = {
   translations: { day: 'translations_day', used: 'translations_used' },
   suggestions: { day: 'suggestions_day', used: 'suggestions_used' },
+  pronunciations: { day: 'pronunciations_day', used: 'pronunciations_used' },
 };
 
 /**
@@ -397,12 +405,15 @@ export async function addPhrase(db: Db, userId: number, text: string, translatio
 /**
  * Changes a phrase's text. Its dates stay as they are, so fixing a typo doesn't
  * reset its 14-day wait or its place in the reminder queue. A new text drops the
- * saved translation. Returns null if the user has no phrase with that id.
+ * saved translation and the last score, which were for the old one. Returns null
+ * if the user has no phrase with that id.
  */
 export async function updatePhrase(db: Db, userId: number, id: number, text: string): Promise<Phrase | null> {
   const { rows } = await db.query(
     `UPDATE phrases
-     SET text = $3, translation_es = CASE WHEN text = $3 THEN translation_es END
+     SET text = $3,
+         translation_es = CASE WHEN text = $3 THEN translation_es END,
+         last_score = CASE WHEN text = $3 THEN last_score END
      WHERE id = $2 AND user_id = $1
      RETURNING ${PHRASE_COLUMNS}`,
     [userId, id, text],
@@ -436,6 +447,16 @@ export async function saveTranslation(
     id,
     text,
     translation,
+  ]);
+}
+
+/** Saves the score of saying a phrase aloud, unless its text changed while it was being scored. */
+export async function saveScore(db: Db, userId: number, id: number, text: string, score: number): Promise<void> {
+  await db.query('UPDATE phrases SET last_score = $4 WHERE id = $2 AND user_id = $1 AND text = $3', [
+    userId,
+    id,
+    text,
+    score,
   ]);
 }
 

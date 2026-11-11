@@ -34,7 +34,7 @@ Railway deploys from this repository, so push it to GitHub first. All settings b
 3. Add a **web service** from this repository:
    - Build command: `npm run build`
    - Start command: `npm start`
-   - Variables: `DATABASE_URL` (reference the Postgres service), `SESSION_SECRET`, `VAPID_PUBLIC_KEY`, `APP_ORIGIN` once the app has a domain, and optionally `MYMEMORY_EMAIL` (see Translations) and `GROQ_API_KEY` (see Suggestions)
+   - Variables: `DATABASE_URL` (reference the Postgres service), `SESSION_SECRET`, `VAPID_PUBLIC_KEY`, `APP_ORIGIN` once the app has a domain, and optionally `MYMEMORY_EMAIL` (see Translations) and `GROQ_API_KEY` (see Suggestions and Pronunciation)
    - Generate a public domain under Networking.
 4. Add a **cron service** from the same repository:
    - Build command: `npm run build`
@@ -94,10 +94,11 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `DELETE /api/phrases/:id` | Yes | 204, or 404 |
 | `GET /api/phrases/:id/translation` | Yes | `{ translation }` in Spanish, or 404. 429 once the user's new translations for the day are used up, and 502 if the translation service fails |
 | `POST /api/suggestions` with `{ text }`, and optionally `context` | Yes | `{ formal, informal }`, each `{ text }`: two ways to say the text in English. `context` (up to 300 characters) says who it's for, where, or what it's about, so the options fit. Saves nothing. 429 once the user's suggestions for the day are used up, 502 if the AI fails, 503 without `GROQ_API_KEY` |
-| `GET /api/usage` | Yes | `{ translations, suggestions }`, each `{ used, limit }`: what the user has used today, and the daily limit (`null` for the admin) |
+| `POST /api/phrases/:id/pronunciation` with a recording as the body, and its type, such as `audio/webm`, as `Content-Type` | Yes | `{ score, words, heard, tip }`: the score from 1 to 10, the phrase's words as `{ text, ok }`, what was heard, and a tip in the user's language. The score is saved as the phrase's `lastScore`. 400 for a body that isn't audio Groq reads, 413 over 1 MB, 422 if nobody spoke, 429 once the user's scores for the day are used up, 502 if Groq fails, 503 without `GROQ_API_KEY` |
+| `GET /api/usage` | Yes | `{ translations, suggestions, pronunciations }`, each `{ used, limit }`: what the user has used today, and the daily limit (`null` for the admin) |
 | `POST /api/push/subscribe` with a `PushSubscription` | Yes | 204 |
 
-Send the token as `Authorization: Bearer <token>`. It's a JWT signed with `SESSION_SECRET`, and `expiresIn` is its lifetime in seconds (43200). Without a valid token, these requests get a 401. Phrases look like `{ id, text, createdAt }`. Another user's phrase gets the same 404 as a missing one.
+Send the token as `Authorization: Bearer <token>`. It's a JWT signed with `SESSION_SECRET`, and `expiresIn` is its lifetime in seconds (43200). Without a valid token, these requests get a 401. Phrases look like `{ id, text, createdAt, lastScore }`, where `lastScore` is the score of the last time the user said it aloud, or `null`. Another user's phrase gets the same 404 as a missing one.
 
 ## Translations
 
@@ -116,6 +117,16 @@ The app speaks English or Spanish, and each user's choice is saved as `language`
 The app's Translate button takes a new phrase the user wants to say, in Spanish or English, and shows a formal and an informal way to say it, in English only. An optional context, such as "Slack message to my manager about a late deploy", helps the AI fit the words and tone to the situation. Saving one adds it as a phrase, which translates to Spanish like any other.
 
 The backend asks `openai/gpt-oss-120b` on [Groq](https://console.groq.com/), whose free plan needs no card. Create a key under API Keys and set it as `GROQ_API_KEY` on the web service; `GROQ_MODEL` picks another model. The free plan allows about 1,000 requests a day and 30 a minute for the whole account (see [rate limits](https://console.groq.com/docs/rate-limits)), so each user may ask for 20 suggestions a day, counted like translations: on their local day, a failed answer is given back, and the admin has no limit. Set `SUGGESTIONS_PER_DAY` to change the 20. With 20 users, that's at most 400 requests a day. What users type is sent to Groq.
+
+## Pronunciation
+
+The app's microphone button records the user saying a phrase, and the backend scores it from 1 to 10. Groq's `whisper-large-v3-turbo` writes down what it heard, without being told the phrase, so it can't fill in what was expected. The score is mostly the share of the phrase's words it heard, lined up so one missed word doesn't throw off the rest, and partly how sure Whisper was. Every word heard and clear gives a 10, every word heard but unclear a 7, and a word missed or heard as another marks it in the phrase. Words heard that aren't in the phrase lower the score too. Case, punctuation, and numbers written as digits or words don't count.
+
+Whisper is built to understand accents, so the score says how clearly the phrase came through more than how native it sounded. Homophones, such as "their" and "there", can count as missed. The weights are a first guess, in `src/pronounce.ts`, to tune with real recordings.
+
+When words were missed, the chat model from Suggestions writes one tip from the difference, such as a short "i" heard as a long "ee"; it never hears the audio. Otherwise the tip is a fixed one, so it costs no request. If the tip fails, the score still comes back with a general tip.
+
+The score is saved with the phrase, and editing the text drops it. The recording is passed on to Groq and never kept. Each user may get 20 scores a day, counted like suggestions: on their local day, a failed one or one with nobody speaking is given back, and the admin has no limit. Set `PRONUNCIATIONS_PER_DAY` to change the 20, and `GROQ_TRANSCRIPTION_MODEL` to use another speech model. Each score takes one speech request, and a chat request when words were missed, from the same free plan as suggestions; with 20 users at 20 a day of each, the chat requests stay under its 1,000 a day.
 
 ## Import your current file
 

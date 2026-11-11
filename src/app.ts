@@ -1,6 +1,7 @@
 import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import { createMiddleware } from 'hono/factory';
+import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
 import { ACCESS_TOKEN_LIFETIME_SECONDS, createAccessToken, readAccessToken } from './auth.js';
 import {
@@ -24,6 +25,7 @@ import {
   normalizeEmail,
   releaseDailyUse,
   reserveDailyUse,
+  saveScore,
   saveSubscription,
   saveTranslation,
   updateSettings,
@@ -37,6 +39,7 @@ import {
 import { hashInviteCode, INVITE_LIFETIME_DAYS, newInviteCode } from './invites.js';
 import { isLanguage, languageFrom, messagesFor, type Messages } from './messages.js';
 import { checkNewPassword, dummyHash, hashPassword, MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
+import { MAX_RECORDING_BYTES, NoSpeechError, recordingType, type Pronouncer, type Pronunciation } from './pronounce.js';
 import { isValidTime, isValidTimeZone, localClock, MAX_PHRASES_PER_DAY } from './schedule.js';
 import { MAX_CONTEXT_LENGTH, type Suggester } from './suggest.js';
 import type { Translator } from './translate.js';
@@ -56,11 +59,19 @@ export interface AppConfig {
   suggest?: Suggester;
   /** Suggestions each user may ask for per local day. The admin has no limit. */
   suggestionsPerDay?: number;
+  /** Scores how the user says a phrase aloud. Without it, asking for a score gets a 503. */
+  pronounce?: Pronouncer;
+  /** Pronunciation scores each user may ask for per local day. The admin has no limit. */
+  pronunciationsPerDay?: number;
 }
 
 export const DEFAULT_TRANSLATIONS_PER_DAY = 30;
 // 20 users at 20 a day stay well inside the AI's free plan of about 1,000 requests a day.
 export const DEFAULT_SUGGESTIONS_PER_DAY = 20;
+// Each score is a speech request, plus a chat request for the tip when words were missed,
+// which shares the chat model's free limit with suggestions: 20 users at 20 a day of each
+// stay under its 1,000 a day.
+export const DEFAULT_PRONUNCIATIONS_PER_DAY = 20;
 
 /** Big enough to never stop anyone, for the admin, whose translations are still counted. */
 const NO_LIMIT = 2_147_483_647;
@@ -155,9 +166,15 @@ export function createApp({
   translationsPerDay = DEFAULT_TRANSLATIONS_PER_DAY,
   suggest,
   suggestionsPerDay = DEFAULT_SUGGESTIONS_PER_DAY,
+  pronounce,
+  pronunciationsPerDay = DEFAULT_PRONUNCIATIONS_PER_DAY,
 }: AppConfig): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
-  const perDay: Record<DailyCounter, number> = { translations: translationsPerDay, suggestions: suggestionsPerDay };
+  const perDay: Record<DailyCounter, number> = {
+    translations: translationsPerDay,
+    suggestions: suggestionsPerDay,
+    pronunciations: pronunciationsPerDay,
+  };
 
   /** The user's local day, from the time zone in their settings, for daily limits. */
   async function userDay(userId: number): Promise<string> {
@@ -286,7 +303,11 @@ export function createApp({
       used: await dailyUses(db, user.id, counter, day),
       limit: user.isAdmin ? null : perDay[counter],
     });
-    return c.json({ translations: await usage('translations'), suggestions: await usage('suggestions') });
+    return c.json({
+      translations: await usage('translations'),
+      suggestions: await usage('suggestions'),
+      pronunciations: await usage('pronunciations'),
+    });
   });
 
   app.get('/api/settings', requireUser, async (c) => c.json(await getSettings(db, c.get('user').id)));
@@ -383,6 +404,42 @@ export function createApp({
       return c.json({ error: m.suggestionsFailed }, 502);
     }
   });
+
+  // The user says the phrase aloud and gets a score from 1 to 10, the phrase's words
+  // marked as heard or not, and a tip. The score is saved with the phrase; the
+  // recording is only passed on to be heard, and never kept.
+  app.post(
+    '/api/phrases/:id/pronunciation',
+    requireUser,
+    bodyLimit({ maxSize: MAX_RECORDING_BYTES, onError: (c) => c.json({ error: say(c).recordingTooLong }, 413) }),
+    async (c) => {
+      const user = c.get('user');
+      const m = say(c);
+      const id = parsePhraseId(c.req.param('id'));
+      const phrase = id === null ? null : await findPhraseTranslation(db, user.id, id);
+      if (id === null || !phrase) return c.json({ error: m.phraseNotFound }, 404);
+
+      const type = recordingType(c.req.header('content-type'));
+      const bytes = type ? await c.req.arrayBuffer() : null;
+      if (!type || !bytes || bytes.byteLength === 0) return c.json({ error: m.invalidRecording }, 400);
+      if (!pronounce) return c.json({ error: m.pronunciationUnavailable }, 503);
+
+      const day = await reserve(user, 'pronunciations');
+      if (!day) return c.json({ error: m.pronunciationLimit(pronunciationsPerDay) }, 429);
+
+      let result: Pronunciation;
+      try {
+        result = await pronounce(phrase.text, { bytes, type }, languageFrom(c.req.header('accept-language')));
+      } catch (error) {
+        await releaseDailyUse(db, user.id, 'pronunciations', day);
+        if (error instanceof NoSpeechError) return c.json({ error: m.noSpeech }, 422);
+        console.error('Pronunciation failed:', error);
+        return c.json({ error: m.pronunciationFailed }, 502);
+      }
+      await saveScore(db, user.id, id, phrase.text, result.score);
+      return c.json(result);
+    },
+  );
 
   app.post('/api/push/subscribe', requireUser, async (c) => {
     const subscription = parseSubscription(await c.req.json().catch(() => null));

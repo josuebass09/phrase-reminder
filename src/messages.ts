@@ -50,6 +50,12 @@ const en = {
   suggestionsUnavailable: "Suggestions aren't available right now",
   suggestionLimit: (limit: number) => `You've used today's ${limit} suggestions. More tomorrow.`,
   suggestionsFailed: "Couldn't get an answer right now. Try again.",
+  invalidRecording: 'Send the recording as audio',
+  recordingTooLong: 'The recording is too long. Say just the phrase.',
+  pronunciationUnavailable: "Pronunciation scores aren't available right now",
+  pronunciationLimit: (limit: number) => `You've used today's ${limit} pronunciation scores. More tomorrow.`,
+  pronunciationFailed: "Couldn't score it right now. Try again.",
+  noSpeech: "Couldn't hear you. Get closer to the microphone and try again.",
 };
 
 export type Messages = typeof en;
@@ -75,6 +81,12 @@ const es: Messages = {
   suggestionsUnavailable: 'Las sugerencias no están disponibles en este momento',
   suggestionLimit: (limit) => `Ya usaste las ${limit} sugerencias de hoy. Mañana tendrás más.`,
   suggestionsFailed: 'No se pudo obtener una respuesta. Inténtalo de nuevo.',
+  invalidRecording: 'Envía la grabación como audio',
+  recordingTooLong: 'La grabación es demasiado larga. Di solo la frase.',
+  pronunciationUnavailable: 'La calificación de pronunciación no está disponible en este momento',
+  pronunciationLimit: (limit) => `Ya usaste las ${limit} calificaciones de pronunciación de hoy. Mañana tendrás más.`,
+  pronunciationFailed: 'No se pudo calificar en este momento. Inténtalo de nuevo.',
+  noSpeech: 'No te escuché. Acércate al micrófono e inténtalo de nuevo.',
 };
 
 const MESSAGES: Record<Language, Messages> = { en, es };

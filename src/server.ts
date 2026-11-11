@@ -1,7 +1,13 @@
 import { serve } from '@hono/node-server';
-import { createApp, DEFAULT_SUGGESTIONS_PER_DAY, DEFAULT_TRANSLATIONS_PER_DAY } from './app.js';
+import {
+  createApp,
+  DEFAULT_PRONUNCIATIONS_PER_DAY,
+  DEFAULT_SUGGESTIONS_PER_DAY,
+  DEFAULT_TRANSLATIONS_PER_DAY,
+} from './app.js';
 import { connect, ensureSchema } from './db.js';
 import { requireEnv } from './env.js';
+import { createGroqPronouncer } from './pronounce.js';
 import { createGroqSuggester } from './suggest.js';
 import { createMyMemoryTranslator } from './translate.js';
 
@@ -19,9 +25,10 @@ function dailyLimit(name: string, fallback: number): number {
   return fallback;
 }
 
-// Optional. Without a key, asking for suggestions answers that they aren't available.
+// Optional. Without a key, asking for suggestions or pronunciation scores answers that they aren't available.
 const groqKey = process.env.GROQ_API_KEY;
-if (!groqKey) console.warn('GROQ_API_KEY is not set, so suggestions are off');
+if (!groqKey) console.warn('GROQ_API_KEY is not set, so suggestions and pronunciation scores are off');
+const groqModel = process.env.GROQ_MODEL || undefined;
 
 const db = connect(requireEnv('DATABASE_URL'));
 await ensureSchema(db);
@@ -38,8 +45,16 @@ const app = createApp({
   // Optional. Raises MyMemory's free daily limit from about 5,000 to 50,000 characters.
   translate: createMyMemoryTranslator({ email: process.env.MYMEMORY_EMAIL || undefined }),
   translationsPerDay: dailyLimit('TRANSLATIONS_PER_DAY', DEFAULT_TRANSLATIONS_PER_DAY),
-  suggest: groqKey ? createGroqSuggester({ apiKey: groqKey, model: process.env.GROQ_MODEL || undefined }) : undefined,
+  suggest: groqKey ? createGroqSuggester({ apiKey: groqKey, model: groqModel }) : undefined,
   suggestionsPerDay: dailyLimit('SUGGESTIONS_PER_DAY', DEFAULT_SUGGESTIONS_PER_DAY),
+  pronounce: groqKey
+    ? createGroqPronouncer({
+        apiKey: groqKey,
+        model: groqModel,
+        transcriptionModel: process.env.GROQ_TRANSCRIPTION_MODEL || undefined,
+      })
+    : undefined,
+  pronunciationsPerDay: dailyLimit('PRONUNCIATIONS_PER_DAY', DEFAULT_PRONUNCIATIONS_PER_DAY),
 });
 
 serve({ fetch: app.fetch, port: Number(process.env.PORT ?? 3000) }, ({ port }) => {

@@ -1,4 +1,7 @@
 import { MAX_PHRASE_LENGTH } from './db.js';
+import { askForJson, DEFAULT_GROQ_MODEL, type GroqConfig } from './groq.js';
+
+export { DEFAULT_GROQ_MODEL } from './groq.js';
 
 /** One way to say a phrase in English. Only the English: the app shows nothing else. */
 export interface PhraseOption {
@@ -19,18 +22,6 @@ export type Suggester = (text: string, context?: string) => Promise<Suggestions>
 
 /** Enough for a sentence or two about the situation. */
 export const MAX_CONTEXT_LENGTH = 300;
-
-export interface GroqConfig {
-  apiKey: string;
-  model?: string;
-  fetch?: typeof fetch;
-  timeoutMs?: number;
-}
-
-/** Free on Groq's free plan, with about 1,000 requests a day for the whole account. */
-export const DEFAULT_GROQ_MODEL = 'openai/gpt-oss-120b';
-
-const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 const INSTRUCTIONS = `You help a Spanish speaker learn English phrases for work and everyday life.
 
@@ -69,51 +60,24 @@ function readOption(value: any, name: string): PhraseOption {
   return { text };
 }
 
-/**
- * Groq's OpenAI-compatible chat API (https://console.groq.com/docs/structured-outputs).
- * Strict structured outputs make the model answer with JSON that matches the schema.
- */
+/** Asks a Groq chat model, which answers with the two options as JSON. */
 export function createGroqSuggester({
   apiKey,
   model = DEFAULT_GROQ_MODEL,
-  fetch: fetchFn = globalThis.fetch,
+  fetch = globalThis.fetch,
   timeoutMs = 20_000,
 }: GroqConfig): Suggester {
   return async (text, context) => {
-    const response = await fetchFn(GROQ_URL, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: INSTRUCTIONS },
-          { role: 'user', content: userMessage(text, context) },
-        ],
-        response_format: { type: 'json_schema', json_schema: { name: 'phrase_options', strict: true, schema: SCHEMA } },
-        // Rewording a phrase needs little thought, and reasoning tokens count toward the free limits.
-        reasoning_effort: 'low',
-        include_reasoning: false,
-        max_completion_tokens: 1024,
-      }),
-      signal: AbortSignal.timeout(timeoutMs),
+    const parsed = await askForJson({
+      apiKey,
+      model,
+      fetch,
+      timeoutMs,
+      system: INSTRUCTIONS,
+      user: userMessage(text, context),
+      name: 'phrase_options',
+      schema: SCHEMA,
     });
-    if (!response.ok) {
-      const detail = await response.text().catch(() => '');
-      throw new Error(`Groq answered HTTP ${response.status}: ${detail.slice(0, 200)}`);
-    }
-
-    const body: any = await response.json().catch(() => null);
-    const choice = body?.choices?.[0];
-    const content = choice?.message?.content;
-    if (typeof content !== 'string' || !content.trim()) {
-      throw new Error(`Groq gave no answer (${String(choice?.finish_reason ?? 'no choices')})`);
-    }
-    let parsed: any;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      throw new Error('Groq answered with invalid JSON');
-    }
     return { formal: readOption(parsed?.formal, 'formal'), informal: readOption(parsed?.informal, 'informal') };
   };
 }

@@ -12,6 +12,7 @@ import {
   type User,
 } from '../src/db.js';
 import { hashPassword } from '../src/passwords.js';
+import { MAX_RECORDING_BYTES, NoSpeechError, type Pronouncer, type Pronunciation } from '../src/pronounce.js';
 import { clearTables, createTestDb, insertAged, insertUser } from './helpers.js';
 
 const PASSWORD = 'correct horse battery staple';
@@ -231,7 +232,7 @@ describe('GET /api/phrases', () => {
     const phrases = await (await requestAs(alice, '/api/phrases')).json();
 
     expect(textOf(phrases)).toEqual(['newer', 'older']);
-    expect(phrases[0]).toEqual({ id: expect.any(Number), text: 'newer', createdAt: expect.any(String) });
+    expect(phrases[0]).toEqual({ id: expect.any(Number), text: 'newer', createdAt: expect.any(String), lastScore: null });
   });
 });
 
@@ -257,6 +258,7 @@ describe('PATCH /api/phrases/:id', () => {
       id: phrase.id,
       text: 'It slipped my mind.',
       createdAt: phrase.createdAt.toISOString(),
+      lastScore: null,
     });
   });
 
@@ -609,7 +611,11 @@ describe('POST /api/suggestions', () => {
     expect(statuses).toEqual([200, 200]);
     expect(third.status).toBe(429);
     expect(await third.json()).toEqual({ error: "You've used today's 2 suggestions. More tomorrow." });
-    expect(counts).toEqual({ translations: { used: 0, limit: 30 }, suggestions: { used: 2, limit: 2 } });
+    expect(counts).toEqual({
+      translations: { used: 0, limit: 30 },
+      suggestions: { used: 2, limit: 2 },
+      pronunciations: { used: 0, limit: 20 },
+    });
     expect((await ask(target, alice, { text: 'uno' })).status).toBe(200);
   });
 
@@ -618,6 +624,164 @@ describe('POST /api/suggestions', () => {
 
     for (const text of ['uno', 'dos']) expect((await ask(target, alice, { text })).status).toBe(200);
 
+    expect(await usage(target, alice)).toEqual({ used: 2, limit: null });
+  });
+});
+
+describe('POST /api/phrases/:id/pronunciation', () => {
+  const RESULT: Pronunciation = {
+    score: 8,
+    words: [
+      { text: 'It', ok: true },
+      { text: 'slipped', ok: false },
+      { text: 'my', ok: true },
+      { text: 'mind.', ok: true },
+    ],
+    heard: 'It slept my mind.',
+    tip: 'Say "slipped" with a short "i", as in "sit".',
+  };
+
+  function appWith(pronounce?: Pronouncer, pronunciationsPerDay?: number) {
+    return createApp({ db, tokenSecret: SECRET, vapidPublicKey: 'k', pronounce, pronunciationsPerDay });
+  }
+
+  async function speak(
+    target: ReturnType<typeof createApp>,
+    user: User | null,
+    id: number | string,
+    { type = 'audio/webm;codecs=opus', body = 'fake audio' as BodyInit, language }: { type?: string; body?: BodyInit; language?: string } = {},
+  ) {
+    const headers: Record<string, string> = { 'Content-Type': type };
+    if (user) headers.Authorization = await bearer(user);
+    if (language) headers['Accept-Language'] = language;
+    return target.request(`/api/phrases/${id}/pronunciation`, { method: 'POST', headers, body });
+  }
+
+  const usage = async (target: ReturnType<typeof createApp>, user: User) =>
+    (await (await target.request('/api/usage', { headers: { Authorization: await bearer(user) } })).json()).pronunciations;
+
+  const lastScore = async (user: User) => (await listRecent(db, user.id))[0].lastScore;
+
+  it('scores the recording, passes on the audio and the language, and saves the score with the phrase', async () => {
+    const phrase = await addPhrase(db, bob.id, 'It slipped my mind.');
+    const pronounce = vi.fn(async () => RESULT);
+    const target = appWith(pronounce);
+
+    const response = await speak(target, bob, phrase.id, { language: 'es-CR,es;q=0.9' });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(RESULT);
+    expect(pronounce).toHaveBeenCalledWith('It slipped my mind.', { bytes: expect.any(ArrayBuffer), type: 'audio/webm' }, 'es');
+    const [, recording] = pronounce.mock.calls[0] as unknown as Parameters<Pronouncer>;
+    expect(new TextDecoder().decode(recording.bytes)).toBe('fake audio');
+    expect(await lastScore(bob)).toBe(8);
+    expect(await usage(target, bob)).toEqual({ used: 1, limit: 20 });
+  });
+
+  it('keeps the score when the text stays the same, and drops it when the text changes', async () => {
+    const phrase = await addPhrase(db, bob.id, 'It slipped my mind.');
+    await speak(appWith(async () => RESULT), bob, phrase.id);
+    const edit = (text: string) => requestAs(bob, `/api/phrases/${phrase.id}`, { method: 'PATCH', body: JSON.stringify({ text }) });
+
+    expect(await (await edit('It slipped my mind.')).json()).toMatchObject({ lastScore: 8 });
+    expect(await (await edit('It totally slipped my mind.')).json()).toMatchObject({ lastScore: null });
+  });
+
+  it.each([
+    ["another user's phrase", async () => (await addPhrase(db, alice.id, 'Hello')).id],
+    ['a missing phrase', async () => 999],
+    ['an id that cannot exist', async () => 'abc'],
+  ])('answers 404 for %s without scoring or counting it', async (_name, idOf) => {
+    const pronounce = vi.fn(async () => RESULT);
+    const target = appWith(pronounce);
+
+    const response = await speak(target, bob, await idOf());
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: 'Phrase not found' });
+    expect(pronounce).not.toHaveBeenCalled();
+    expect(await usage(target, bob)).toEqual({ used: 0, limit: 20 });
+  });
+
+  it.each([
+    ['JSON', { type: 'application/json', body: '{"text":"hi"}' }],
+    ['audio Groq cannot read', { type: 'audio/aiff' }],
+    ['an empty recording', { body: '' }],
+  ])('rejects %s without scoring or counting it', async (_name, options) => {
+    const phrase = await addPhrase(db, bob.id, 'Hello');
+    const pronounce = vi.fn(async () => RESULT);
+    const target = appWith(pronounce);
+
+    const response = await speak(target, bob, phrase.id, options);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: 'Send the recording as audio' });
+    expect(pronounce).not.toHaveBeenCalled();
+    expect(await usage(target, bob)).toEqual({ used: 0, limit: 20 });
+  });
+
+  it('answers 413 for a recording over the size limit', async () => {
+    const phrase = await addPhrase(db, bob.id, 'Hello');
+    const pronounce = vi.fn(async () => RESULT);
+
+    const response = await speak(appWith(pronounce), bob, phrase.id, { body: new Uint8Array(MAX_RECORDING_BYTES + 1) });
+
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual({ error: 'The recording is too long. Say just the phrase.' });
+    expect(pronounce).not.toHaveBeenCalled();
+  });
+
+  it('requires a token', async () => {
+    const phrase = await addPhrase(db, bob.id, 'Hello');
+
+    expect((await speak(appWith(async () => RESULT), null, phrase.id)).status).toBe(401);
+  });
+
+  it('answers 503 when no scoring is set up', async () => {
+    const phrase = await addPhrase(db, bob.id, 'Hello');
+
+    const response = await speak(appWith(), bob, phrase.id);
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "Pronunciation scores aren't available right now" });
+  });
+
+  it('answers 422 for a recording with nobody speaking, and does not count it or save a score', async () => {
+    const phrase = await addPhrase(db, bob.id, 'Hello');
+    const target = appWith(vi.fn().mockRejectedValue(new NoSpeechError()));
+
+    const response = await speak(target, bob, phrase.id, { language: 'es' });
+
+    expect(response.status).toBe(422);
+    expect(await response.json()).toEqual({ error: 'No te escuché. Acércate al micrófono e inténtalo de nuevo.' });
+    expect(await usage(target, bob)).toEqual({ used: 0, limit: 20 });
+    expect(await lastScore(bob)).toBeNull();
+  });
+
+  it('answers 502 and does not count it when scoring fails', async () => {
+    const phrase = await addPhrase(db, bob.id, 'Hello');
+    const target = appWith(vi.fn().mockRejectedValue(new Error('Groq answered HTTP 500')));
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const response = await speak(target, bob, phrase.id);
+    quiet.mockRestore();
+
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({ error: "Couldn't score it right now. Try again." });
+    expect(await usage(target, bob)).toEqual({ used: 0, limit: 20 });
+  });
+
+  it('allows each user that many a day, then answers 429, but does not limit the admin', async () => {
+    const target = appWith(async () => RESULT, 1);
+    const bobs = await addPhrase(db, bob.id, 'Hello');
+    const alices = await addPhrase(db, alice.id, 'Hello');
+
+    expect((await speak(target, bob, bobs.id)).status).toBe(200);
+    const second = await speak(target, bob, bobs.id);
+    for (let i = 0; i < 2; i++) expect((await speak(target, alice, alices.id)).status).toBe(200);
+
+    expect(second.status).toBe(429);
+    expect(await second.json()).toEqual({ error: "You've used today's 1 pronunciation scores. More tomorrow." });
     expect(await usage(target, alice)).toEqual({ used: 2, limit: null });
   });
 });
@@ -673,6 +837,7 @@ describe('GET /api/usage', () => {
     expect(await (await requestAs(bob, '/api/usage')).json()).toEqual({
       translations: { used: 0, limit: 30 },
       suggestions: { used: 0, limit: 20 },
+      pronunciations: { used: 0, limit: 20 },
     });
   });
 });
