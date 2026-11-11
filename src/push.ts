@@ -1,5 +1,6 @@
 import webpush from 'web-push';
 import type { DeviceSubscription, Phrase } from './db.js';
+import type { Language } from './messages.js';
 
 export type PushSender = (subscription: DeviceSubscription, payload: string) => Promise<unknown>;
 
@@ -21,24 +22,38 @@ function shorten(text: string, limit: number): string {
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }
 
+const GREETINGS: Record<Language, { morning: string; afternoon: string; evening: string }> = {
+  en: { morning: '🌅 Good morning!', afternoon: '☀️ Good afternoon!', evening: '🌙 Good evening!' },
+  es: { morning: '🌅 ¡Buenos días!', afternoon: '☀️ ¡Buenas tardes!', evening: '🌙 ¡Buenas noches!' },
+};
+
+const FOR_TODAY: Record<Language, (count: number) => string> = {
+  en: (count) => (count === 1 ? '1 phrase for today' : `${count} phrases for today`),
+  es: (count) => (count === 1 ? '1 frase para hoy' : `${count} frases para hoy`),
+};
+
 /** A greeting for the user's local time: morning from 5:00, afternoon from 12:00, evening from 18:00. */
-export function greeting(localMinutes: number): string {
+export function greeting(localMinutes: number, language: Language = 'en'): string {
   const hour = Math.floor(localMinutes / 60);
-  if (hour >= 5 && hour < 12) return '🌅 Good morning!';
-  if (hour >= 12 && hour < 18) return '☀️ Good afternoon!';
-  return '🌙 Good evening!';
+  const { morning, afternoon, evening } = GREETINGS[language];
+  if (hour >= 5 && hour < 12) return morning;
+  if (hour >= 12 && hour < 18) return afternoon;
+  return evening;
 }
 
 /**
- * The notification: a greeting for the user's local time with how many phrases
- * there are, such as "☀️ Good afternoon! 3 phrases for today", then one bulleted
- * phrase per line.
+ * The notification, in the user's language: a greeting for their local time with
+ * how many phrases there are, such as "☀️ Good afternoon! 3 phrases for today",
+ * then one bulleted phrase per line.
  */
-export function notificationPayload(phrases: Pick<Phrase, 'text'>[], localMinutes: number): string {
-  const count = phrases.length === 1 ? '1 phrase' : `${phrases.length} phrases`;
+export function notificationPayload(
+  phrases: Pick<Phrase, 'text'>[],
+  localMinutes: number,
+  language: Language = 'en',
+): string {
   const limit = Math.min(MAX_NOTIFICATION_PHRASE_LENGTH, Math.floor(MAX_NOTIFICATION_TEXT_LENGTH / Math.max(phrases.length, 1)));
   return JSON.stringify({
-    title: `${greeting(localMinutes)} ${count} for today`,
+    title: `${greeting(localMinutes, language)} ${FOR_TODAY[language](phrases.length)}`,
     body: phrases.map((phrase) => `• ${shorten(phrase.text, limit)}`).join('\n'),
   });
 }

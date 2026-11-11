@@ -622,6 +622,48 @@ describe('POST /api/suggestions', () => {
   });
 });
 
+describe('messages for people', () => {
+  it('come in the language the app asks for, and in English otherwise', async () => {
+    const signup = (language?: string) =>
+      app.request('/api/signup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(language ? { 'Accept-Language': language } : {}) },
+        body: JSON.stringify({ email: 'new@example.com', password: 'a long enough password', code: 'nope' }),
+      });
+
+    expect(await (await signup('es')).json()).toEqual({ error: 'Esta invitación no es válida, ya se usó o venció' });
+    expect(await (await signup('es-CR,es;q=0.9,en;q=0.8')).json()).toEqual({
+      error: 'Esta invitación no es válida, ya se usó o venció',
+    });
+    expect(await (await signup('fr-FR,en;q=0.5')).json()).toEqual({
+      error: 'This invite is not valid, was already used, or has expired',
+    });
+    expect(await (await signup()).json()).toEqual({ error: 'This invite is not valid, was already used, or has expired' });
+  });
+
+  it("say today's limit in Spanish", async () => {
+    const target = createApp({
+      db,
+      tokenSecret: SECRET,
+      vapidPublicKey: 'k',
+      suggest: async () => ({ formal: { text: 'a', es: 'a' }, informal: { text: 'b', es: 'b' } }),
+      suggestionsPerDay: 1,
+    });
+    const ask = async () =>
+      target.request('/api/suggestions', {
+        method: 'POST',
+        headers: { Authorization: await bearer(bob), 'Content-Type': 'application/json', 'Accept-Language': 'es' },
+        body: JSON.stringify({ text: 'Hola' }),
+      });
+
+    await ask();
+    const limited = await ask();
+
+    expect(limited.status).toBe(429);
+    expect(await limited.json()).toEqual({ error: 'Ya usaste las 1 sugerencias de hoy. Mañana tendrás más.' });
+  });
+});
+
 describe('GET /api/usage', () => {
   it('requires a token', async () => {
     expect((await requestAs(null, '/api/usage')).status).toBe(401);
@@ -749,6 +791,7 @@ describe('/api/settings', () => {
       reminderTime: '12:00',
       timeZone: 'America/Costa_Rica',
       phrasesPerDay: 3,
+      language: null,
     });
   });
 
@@ -761,6 +804,7 @@ describe('/api/settings', () => {
       reminderTime: '08:30',
       timeZone: 'Europe/Madrid',
       phrasesPerDay: 3,
+      language: null,
     });
     await patch(alice, { remindersOn: false, phrasesPerDay: 5 });
     expect(await (await requestAs(alice, '/api/settings')).json()).toMatchObject({
@@ -777,6 +821,7 @@ describe('/api/settings', () => {
     ['too many phrases', { phrasesPerDay: 6 }, 'phrasesPerDay must be a whole number from 1 to 5'],
     ['a fraction of a phrase', { phrasesPerDay: 2.5 }, 'phrasesPerDay must be a whole number from 1 to 5'],
     ['a non-boolean switch', { remindersOn: 'yes' }, 'remindersOn must be true or false'],
+    ['an unknown language', { language: 'fr' }, 'language must be en or es'],
     ['nothing to change', { color: 'blue' }, 'Nothing to change'],
     ['invalid JSON', 'not json', 'Send the settings to change as a JSON object'],
   ])('rejects %s and changes nothing', async (_name, body, error) => {
@@ -785,6 +830,13 @@ describe('/api/settings', () => {
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error });
     expect((await (await requestAs(alice, '/api/settings')).json()).reminderTime).toBe('12:00');
+  });
+
+  it("saves the app's language", async () => {
+    const response = await patch(alice, { language: 'es' });
+
+    expect((await response.json()).language).toBe('es');
+    expect((await (await requestAs(alice, '/api/settings')).json()).language).toBe('es');
   });
 
   it('requires a token', async () => {

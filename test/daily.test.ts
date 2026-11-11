@@ -246,6 +246,7 @@ describe('reminder schedule', () => {
       reminderTime: '12:00',
       timeZone: 'America/Costa_Rica',
       phrasesPerDay: 3,
+      language: null,
     });
   });
 });
@@ -272,6 +273,12 @@ describe('notificationPayload', () => {
     expect(greeting(minutes)).toBe(expected);
   });
 
+  it('speaks Spanish when that is the language', () => {
+    expect(JSON.parse(notificationPayload([{ text: 'A.' }, { text: 'B.' }], at(19), 'es')).title).toBe('🌙 ¡Buenas noches! 2 frases para hoy');
+    expect(JSON.parse(notificationPayload([{ text: 'A.' }], at(8), 'es')).title).toBe('🌅 ¡Buenos días! 1 frase para hoy');
+    expect(greeting(at(13), 'es')).toBe('☀️ ¡Buenas tardes!');
+  });
+
   it('says "1 phrase" for a single one', () => {
     expect(JSON.parse(notificationPayload([{ text: 'Only.' }], at(8))).title).toBe('🌅 Good morning! 1 phrase for today');
   });
@@ -296,5 +303,16 @@ describe('reminder notifications', () => {
     await sendDueReminders(db, send, new Date('2026-11-10T18:05:00Z')); // 19:05 in Madrid
 
     expect(JSON.parse(send.mock.calls[0][1])).toEqual({ title: '🌙 Good evening! 1 phrase for today', body: '• old one' });
+  });
+
+  it("come in the user's language", async () => {
+    await insertAged(db, alice.id, 'old one', 20);
+    await saveSubscription(db, alice.id, phone);
+    await updateSettings(db, alice.id, { language: 'es' });
+    const send = vi.fn().mockResolvedValue(undefined);
+
+    await sendDueReminders(db, send, NOON);
+
+    expect(JSON.parse(send.mock.calls[0][1]).title).toBe('☀️ ¡Buenas tardes! 1 frase para hoy');
   });
 });

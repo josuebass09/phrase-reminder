@@ -85,8 +85,8 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `POST /api/signup` with `{ email, password, code }` | No | The same as a login, 201. 403 if the invite is unknown, used, or expired, 409 if the email has an account, 400 for an invalid email or password |
 | `POST /api/invites` | Admin | `{ code, expiresAt }`, 201. 403 for other users |
 | `GET /api/me` | Yes | `{ id, email, isAdmin }` |
-| `GET /api/settings` | Yes | `{ remindersOn, reminderTime, timeZone, phrasesPerDay }` |
-| `PATCH /api/settings` with any of those | Yes | All the settings after the change, or 400 with what's wrong. `reminderTime` is 24-hour `HH:MM`, `timeZone` an IANA zone such as `America/Costa_Rica`, and `phrasesPerDay` 1 to 5 |
+| `GET /api/settings` | Yes | `{ remindersOn, reminderTime, timeZone, phrasesPerDay, language }`; `language` is `null` until the app saves one |
+| `PATCH /api/settings` with any of those | Yes | All the settings after the change, or 400 with what's wrong. `reminderTime` is 24-hour `HH:MM`, `timeZone` an IANA zone such as `America/Costa_Rica`, `phrasesPerDay` 1 to 5, and `language` `en` or `es` |
 | `GET /api/phrases` | Yes | The user's 50 newest phrases |
 | `GET /api/today` | Yes | The phrases from the user's latest reminder |
 | `POST /api/phrases` with `{ text }`, and optionally `translation` | Yes | The saved phrase, 201. A `translation` (Spanish, up to 1,000 characters) is saved as the phrase's translation |
@@ -106,6 +106,10 @@ The app can show each phrase in Spanish. The backend asks [MyMemory](https://mym
 MyMemory's free limit is about 5,000 characters a day per server. Set `MYMEMORY_EMAIL` on the web service to a contact email to raise it to about 50,000. When the limit runs out, the app says it couldn't translate, and the phrase can be translated the next day.
 
 So one person can't use up that shared limit, each user may ask for 30 new translations a day, counted on their local day from their settings' time zone. Opening a saved translation doesn't count, a failed translation is given back, and the admin has no limit (their translations are still counted). Set `TRANSLATIONS_PER_DAY` on the web service to change the 30. With 20 users of about 55-character phrases, 30 each comes to at most about 33,000 characters a day, within the 50,000 with room to spare. Settings in the app shows each user how many they've used today.
+
+## Languages
+
+The app speaks English or Spanish, and each user's choice is saved as `language` in their settings. The daily notification uses it, such as "☀️ ¡Buenas tardes! 3 frases para hoy". The app also sends it as `Accept-Language`, and the API writes its messages for people in that language, such as today's limit or a used invite; anything else gets English.
 
 ## Suggestions
 

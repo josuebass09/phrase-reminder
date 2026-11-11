@@ -76,7 +76,7 @@ export async function sendDueReminders(db: Db, send: PushSender, now = new Date(
     result.phrases += phrases.length;
     result.devices += subscriptions.length;
 
-    const payload = notificationPayload(phrases, localClock(now, candidate.timeZone).minutes);
+    const payload = notificationPayload(phrases, localClock(now, candidate.timeZone).minutes, candidate.language ?? 'en');
     const delivered = await pushToDevices(db, send, subscriptions, payload, result.errors);
     result.delivered += delivered;
     if (delivered > 0) {

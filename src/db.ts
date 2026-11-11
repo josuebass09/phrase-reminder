@@ -1,4 +1,5 @@
 import pg from 'pg';
+import type { Language } from './messages.js';
 
 export const MAX_PHRASE_LENGTH = 500;
 /** A Spanish translation can run longer than its English phrase. */
@@ -27,6 +28,8 @@ export interface ReminderSettings {
   /** IANA time zone, such as America/Costa_Rica, taken from the user's device. */
   timeZone: string;
   phrasesPerDay: number;
+  /** The app's language, which the reminders use too. Null until the app saves the device's. */
+  language: Language | null;
 }
 
 export const DEFAULT_SETTINGS: ReminderSettings = {
@@ -34,6 +37,7 @@ export const DEFAULT_SETTINGS: ReminderSettings = {
   reminderTime: '12:00',
   timeZone: 'America/Costa_Rica',
   phrasesPerDay: 3,
+  language: null,
 };
 
 /** A user who may be due a reminder: reminders on, and at least one device. */
@@ -63,7 +67,7 @@ export interface DeviceSubscription {
 const PHRASE_COLUMNS = 'id, text, created_at AS "createdAt"';
 const USER_COLUMNS = 'id, email, is_admin AS "isAdmin"';
 const SETTINGS_COLUMNS =
-  'reminders_on AS "remindersOn", reminder_time AS "reminderTime", time_zone AS "timeZone", phrases_per_day AS "phrasesPerDay"';
+  'reminders_on AS "remindersOn", reminder_time AS "reminderTime", time_zone AS "timeZone", phrases_per_day AS "phrasesPerDay", language';
 
 export function connect(connectionString: string): Db & { end(): Promise<void> } {
   // Timeouts matter for the cron job: a hung run makes Railway skip the next one.
@@ -98,6 +102,8 @@ export async function ensureSchema(db: Db): Promise<void> {
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reminder_time TEXT NOT NULL DEFAULT '${DEFAULT_SETTINGS.reminderTime}'`);
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS time_zone TEXT NOT NULL DEFAULT '${DEFAULT_SETTINGS.timeZone}'`);
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phrases_per_day INTEGER NOT NULL DEFAULT ${DEFAULT_SETTINGS.phrasesPerDay}`);
+  // The app's language, chosen in the app; the reminders use it too.
+  await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT');
   // The user's local day of the last reminder sent, so each day gets one.
   await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_reminder_day TEXT');
   // New translations used on the user's local day, for the daily limit.
@@ -268,6 +274,7 @@ export async function updateSettings(
     reminderTime: 'reminder_time',
     timeZone: 'time_zone',
     phrasesPerDay: 'phrases_per_day',
+    language: 'language',
   };
   const entries = (Object.keys(columns) as (keyof ReminderSettings)[]).filter((key) => changes[key] !== undefined);
   if (entries.length === 0) return getSettings(db, userId);

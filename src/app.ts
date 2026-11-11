@@ -35,7 +35,8 @@ import {
   type User,
 } from './db.js';
 import { hashInviteCode, INVITE_LIFETIME_DAYS, newInviteCode } from './invites.js';
-import { checkNewPassword, dummyHash, hashPassword, MAX_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
+import { isLanguage, languageFrom, messagesFor, type Messages } from './messages.js';
+import { checkNewPassword, dummyHash, hashPassword, MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
 import { isValidTime, isValidTimeZone, localClock, MAX_PHRASES_PER_DAY } from './schedule.js';
 import { MAX_CONTEXT_LENGTH, type Suggester } from './suggest.js';
 import type { Translator } from './translate.js';
@@ -132,17 +133,18 @@ function parseSettingsChanges(body: any): { changes: Partial<ReminderSettings> }
     }
     changes.phrasesPerDay = count;
   }
+  if (body.language !== undefined) {
+    if (!isLanguage(body.language)) return { error: 'language must be en or es' };
+    changes.language = body.language;
+  }
   if (Object.keys(changes).length === 0) return { error: 'Nothing to change' };
   return { changes };
 }
 
-const INVALID_TEXT = { error: `Phrase must be 1 to ${MAX_PHRASE_LENGTH} characters` };
-const INVALID_TRANSLATION = { error: `Translation must be text of up to ${MAX_TRANSLATION_LENGTH} characters` };
-const INVALID_CONTEXT = { error: `Context must be text of up to ${MAX_CONTEXT_LENGTH} characters` };
-const NOT_FOUND = { error: 'Phrase not found' };
-const WRONG_LOGIN = { error: 'Wrong email or password' };
-const UNUSABLE_INVITE = { error: 'This invite is not valid, was already used, or has expired' };
-const EMAIL_TAKEN = { error: 'An account with that email already exists' };
+/** Messages for people, in the language the app asked for with Accept-Language. */
+function say(c: Context): Messages {
+  return messagesFor(languageFrom(c.req.header('accept-language')));
+}
 
 export function createApp({
   db,
@@ -189,7 +191,7 @@ export function createApp({
       ? await readAccessToken(tokenSecret, authorization.slice(7))
       : null;
     const user = userId === null ? null : await findUser(db, userId);
-    if (!user) return c.json({ error: 'Not logged in' }, 401);
+    if (!user) return c.json({ error: say(c).notLoggedIn }, 401);
     c.set('user', user);
     await next();
   });
@@ -200,7 +202,7 @@ export function createApp({
       cors({
         origin: appOrigins,
         allowMethods: ['GET', 'POST', 'PATCH', 'DELETE'],
-        allowHeaders: ['Authorization', 'Content-Type'],
+        allowHeaders: ['Authorization', 'Content-Type', 'Accept-Language'],
         maxAge: 86_400,
       }),
     );
@@ -220,12 +222,12 @@ export function createApp({
     const body = await c.req.json().catch(() => null);
     const email = typeof body?.email === 'string' ? normalizeEmail(body.email) : '';
     const password = typeof body?.password === 'string' ? body.password : '';
-    if (!email || !password) return c.json({ error: 'Email and password are required' }, 400);
-    if (password.length > MAX_PASSWORD_LENGTH) return c.json(WRONG_LOGIN, 401);
+    if (!email || !password) return c.json({ error: say(c).loginRequired }, 400);
+    if (password.length > MAX_PASSWORD_LENGTH) return c.json({ error: say(c).wrongLogin }, 401);
 
     const user = await findUserByEmail(db, email);
     const matches = await verifyPassword(password, user?.passwordHash ?? (await dummyHash()));
-    if (!user || !matches) return c.json(WRONG_LOGIN, 401);
+    if (!user || !matches) return c.json({ error: say(c).wrongLogin }, 401);
 
     return c.json(await sessionFor(user));
   });
@@ -236,25 +238,27 @@ export function createApp({
     const email = typeof body?.email === 'string' ? normalizeEmail(body.email) : '';
     const password = typeof body?.password === 'string' ? body.password : '';
     const code = typeof body?.code === 'string' ? body.code.trim() : '';
-    if (!email || !password || !code) return c.json({ error: 'Email, password, and invite code are required' }, 400);
+    const m = say(c);
+    if (!email || !password || !code) return c.json({ error: m.signupRequired }, 400);
 
     // The invite comes first, so without one nobody learns which emails have an account.
     const codeHash = hashInviteCode(code);
-    if (!(await isInviteUsable(db, codeHash))) return c.json(UNUSABLE_INVITE, 403);
-    if (!isValidEmail(email)) return c.json({ error: 'Enter a valid email' }, 400);
-    const passwordProblem = checkNewPassword(password);
-    if (passwordProblem) return c.json({ error: `${passwordProblem} for the password` }, 400);
-    if (await findUserByEmail(db, email)) return c.json(EMAIL_TAKEN, 409);
+    if (!(await isInviteUsable(db, codeHash))) return c.json({ error: m.unusableInvite }, 403);
+    if (!isValidEmail(email)) return c.json({ error: m.invalidEmail }, 400);
+    if (checkNewPassword(password)) {
+      return c.json({ error: password.length < MIN_PASSWORD_LENGTH ? m.passwordTooShort : m.passwordTooLong }, 400);
+    }
+    if (await findUserByEmail(db, email)) return c.json({ error: m.emailTaken }, 409);
 
     // Claimed before the account exists, so two sign-ups can't share it.
     const inviteId = await claimInvite(db, codeHash);
-    if (inviteId === null) return c.json(UNUSABLE_INVITE, 403);
+    if (inviteId === null) return c.json({ error: m.unusableInvite }, 403);
     let user: User;
     try {
       user = await createUser(db, email, await hashPassword(password));
     } catch (error) {
       await finishInvite(db, inviteId, null);
-      if (isUniqueViolation(error)) return c.json(EMAIL_TAKEN, 409);
+      if (isUniqueViolation(error)) return c.json({ error: m.emailTaken }, 409);
       throw error;
     }
     await finishInvite(db, inviteId, user.id);
@@ -265,7 +269,7 @@ export function createApp({
   // Returns the code once. Only its hash is stored, so it can't be shown again.
   app.post('/api/invites', requireUser, async (c) => {
     const user = c.get('user');
-    if (!user.isAdmin) return c.json({ error: 'Only the admin can invite people' }, 403);
+    if (!user.isAdmin) return c.json({ error: say(c).onlyAdminInvites }, 403);
 
     const code = newInviteCode();
     const { expiresAt } = await createInvite(db, user.id, hashInviteCode(code), INVITE_LIFETIME_DAYS);
@@ -301,11 +305,11 @@ export function createApp({
   app.post('/api/phrases', requireUser, async (c) => {
     const body = await c.req.json().catch(() => null);
     const text = phraseTextOf(body);
-    if (!text) return c.json(INVALID_TEXT, 400);
+    if (!text) return c.json({ error: say(c).invalidText }, 400);
     // Optional. A suggested phrase comes with its Spanish, so translating it later is free.
     const translation = body.translation ?? null;
     if (translation !== null && (typeof translation !== 'string' || translation.length > MAX_TRANSLATION_LENGTH)) {
-      return c.json(INVALID_TRANSLATION, 400);
+      return c.json({ error: say(c).invalidTranslation }, 400);
     }
 
     return c.json(await addPhrase(db, c.get('user').id, text, translation?.trim() || null), 201);
@@ -314,18 +318,18 @@ export function createApp({
   // Another user's phrase gets the same 404 as a missing one, so ids reveal nothing.
   app.patch('/api/phrases/:id', requireUser, async (c) => {
     const id = parsePhraseId(c.req.param('id'));
-    if (id === null) return c.json(NOT_FOUND, 404);
+    if (id === null) return c.json({ error: say(c).phraseNotFound }, 404);
 
     const text = await readPhraseText(c);
-    if (!text) return c.json(INVALID_TEXT, 400);
+    if (!text) return c.json({ error: say(c).invalidText }, 400);
 
     const phrase = await updatePhrase(db, c.get('user').id, id, text);
-    return phrase ? c.json(phrase) : c.json(NOT_FOUND, 404);
+    return phrase ? c.json(phrase) : c.json({ error: say(c).phraseNotFound }, 404);
   });
 
   app.delete('/api/phrases/:id', requireUser, async (c) => {
     const id = parsePhraseId(c.req.param('id'));
-    if (id === null || !(await deletePhrase(db, c.get('user').id, id))) return c.json(NOT_FOUND, 404);
+    if (id === null || !(await deletePhrase(db, c.get('user').id, id))) return c.json({ error: say(c).phraseNotFound }, 404);
 
     return c.body(null, 204);
   });
@@ -335,13 +339,13 @@ export function createApp({
     const userId = c.get('user').id;
     const id = parsePhraseId(c.req.param('id'));
     const phrase = id === null ? null : await findPhraseTranslation(db, userId, id);
-    if (id === null || !phrase) return c.json(NOT_FOUND, 404);
+    if (id === null || !phrase) return c.json({ error: say(c).phraseNotFound }, 404);
     if (phrase.translation) return c.json({ translation: phrase.translation });
-    if (!translate) return c.json({ error: "Translation isn't available" }, 503);
+    if (!translate) return c.json({ error: say(c).translationUnavailable }, 503);
 
     // Only new translations count toward the daily limit; saved ones above are free.
     const day = await reserve(c.get('user'), 'translations');
-    if (!day) return c.json({ error: `You've used today's ${translationsPerDay} translations. More tomorrow.` }, 429);
+    if (!day) return c.json({ error: say(c).translationLimit(translationsPerDay) }, 429);
 
     let translation: string;
     try {
@@ -349,7 +353,7 @@ export function createApp({
     } catch (error) {
       await releaseDailyUse(db, userId, 'translations', day);
       console.error('Translation failed:', error);
-      return c.json({ error: "Couldn't translate right now" }, 502);
+      return c.json({ error: say(c).translationFailed }, 502);
     }
     await saveTranslation(db, userId, id, phrase.text, translation);
     return c.json({ translation });
@@ -360,22 +364,23 @@ export function createApp({
   app.post('/api/suggestions', requireUser, async (c) => {
     const body = await c.req.json().catch(() => null);
     const text = phraseTextOf(body);
-    if (!text) return c.json(INVALID_TEXT, 400);
+    const m = say(c);
+    if (!text) return c.json({ error: m.invalidText }, 400);
     // Optional: who it's for, where, or what it's about, so the options fit the situation.
     const context = body.context ?? '';
-    if (typeof context !== 'string' || context.length > MAX_CONTEXT_LENGTH) return c.json(INVALID_CONTEXT, 400);
-    if (!suggest) return c.json({ error: "Suggestions aren't available right now" }, 503);
+    if (typeof context !== 'string' || context.length > MAX_CONTEXT_LENGTH) return c.json({ error: m.invalidContext }, 400);
+    if (!suggest) return c.json({ error: m.suggestionsUnavailable }, 503);
 
     const user = c.get('user');
     const day = await reserve(user, 'suggestions');
-    if (!day) return c.json({ error: `You've used today's ${suggestionsPerDay} suggestions. More tomorrow.` }, 429);
+    if (!day) return c.json({ error: m.suggestionLimit(suggestionsPerDay) }, 429);
 
     try {
       return c.json(await suggest(text, context.trim() || undefined));
     } catch (error) {
       await releaseDailyUse(db, user.id, 'suggestions', day);
       console.error('Suggestions failed:', error);
-      return c.json({ error: "Couldn't get an answer right now. Try again." }, 502);
+      return c.json({ error: m.suggestionsFailed }, 502);
     }
   });
 
