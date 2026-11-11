@@ -379,6 +379,7 @@ describe('GET /api/phrases', () => {
       createdAt: expect.any(String),
       translation: null,
       lastScore: null,
+      dueAt: null,
     });
   });
 });
@@ -457,6 +458,7 @@ describe('PATCH /api/phrases/:id', () => {
       createdAt: phrase.createdAt.toISOString(),
       translation: null,
       lastScore: null,
+      dueAt: null,
     });
   });
 
@@ -574,7 +576,10 @@ describe('/api/phrases/:id/review', () => {
     const id = await sendPhrase(alice, 'It slipped my mind.');
     await sendPhrase(alice, 'Keep me posted.');
 
-    expect((await review(alice, id, 'remembered')).status).toBe(204);
+    const response = await review(alice, id, 'remembered');
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ box: 1, days: 7 }); // Spaced repetition's first step.
 
     expect(await todayOf(alice)).toEqual(['Keep me posted.']);
     expect(await answers(id)).toEqual(['phrase_remembered']);

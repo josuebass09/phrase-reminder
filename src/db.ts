@@ -60,6 +60,8 @@ export interface Phrase {
   translation: string | null;
   /** The score of the last time the user said it aloud, from 1 to 10, or null if never. */
   lastScore: number | null;
+  /** When spaced repetition has it come back, or null until the user first answers it on Today. */
+  dueAt: Date | null;
 }
 
 export interface DeviceSubscription {
@@ -69,7 +71,7 @@ export interface DeviceSubscription {
 }
 
 const PHRASE_COLUMNS =
-  'id, text, created_at AS "createdAt", translation_es AS "translation", last_score AS "lastScore"';
+  'id, text, created_at AS "createdAt", translation_es AS "translation", last_score AS "lastScore", due_at AS "dueAt"';
 const USER_COLUMNS = 'id, email, is_admin AS "isAdmin"';
 const SETTINGS_COLUMNS =
   'reminders_on AS "remindersOn", reminder_time AS "reminderTime", time_zone AS "timeZone", phrases_per_day AS "phrasesPerDay", language';
@@ -165,6 +167,12 @@ export async function ensureSchema(db: Db): Promise<void> {
   // When the user last swiped the phrase away from Today as read or remembered. It comes back
   // when a later reminder sends it again, since that sets a newer last_shown_at.
   await db.query('ALTER TABLE phrases ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ');
+  // Spaced repetition: the phrase's box (null until first answered, 0 after "read", 1 to 4 for
+  // remembered that many times running) and when it's due again. Undo puts back the previous pair.
+  await db.query('ALTER TABLE phrases ADD COLUMN IF NOT EXISTS box SMALLINT');
+  await db.query('ALTER TABLE phrases ADD COLUMN IF NOT EXISTS due_at TIMESTAMPTZ');
+  await db.query('ALTER TABLE phrases ADD COLUMN IF NOT EXISTS undo_box SMALLINT');
+  await db.query('ALTER TABLE phrases ADD COLUMN IF NOT EXISTS undo_due_at TIMESTAMPTZ');
   // One row per login, kept while the app uses it (see auth.ts). Only hashes of refresh
   // tokens are kept; the one each refresh replaced stays a while to notice it coming back.
   await db.query(`
@@ -631,7 +639,10 @@ export async function updatePhrase(db: Db, userId: number, id: number, text: str
     `UPDATE phrases
      SET text = $3,
          translation_es = CASE WHEN text = $3 THEN translation_es END,
-         last_score = CASE WHEN text = $3 THEN last_score END
+         last_score = CASE WHEN text = $3 THEN last_score END,
+         -- New words start their spacing over.
+         box = CASE WHEN text = $3 THEN box END,
+         due_at = CASE WHEN text = $3 THEN due_at END
      WHERE id = $2 AND user_id = $1
      RETURNING ${PHRASE_COLUMNS}`,
     [userId, id, text],
@@ -714,13 +725,18 @@ export async function listRecent(db: Db, userId: number, { search, before, limit
   return rows;
 }
 
-/** Phrases at least 14 days old: never-shown first, then longest since shown. */
+/**
+ * Phrases at least 14 days old that are due: first those spaced repetition has scheduled and
+ * are due now, the longest overdue first; then the ones never answered, never-shown first and
+ * then longest since shown. A scheduled phrase that isn't due yet waits for its day.
+ */
 export async function pickDailyPhrases(db: Db, userId: number, limit = 3): Promise<Phrase[]> {
   const { rows } = await db.query(
     `SELECT ${PHRASE_COLUMNS}
      FROM phrases
      WHERE user_id = $1 AND created_at <= now() - interval '14 days'
-     ORDER BY last_shown_at ASC NULLS FIRST, random()
+       AND (due_at IS NULL OR due_at <= now())
+     ORDER BY due_at IS NULL, due_at ASC, last_shown_at ASC NULLS FIRST, random()
      LIMIT $2`,
     [userId, limit],
   );
@@ -745,8 +761,17 @@ export async function listToday(db: Db, userId: number): Promise<Phrase[]> {
   return rows;
 }
 
+/**
+ * Marks phrases as sent. A scheduled one comes back with tomorrow's reminder unless it's answered,
+ * behind any due longer, so one left unanswered doesn't take every day's place.
+ */
 export async function markShown(db: Db, ids: number[]): Promise<void> {
-  await db.query('UPDATE phrases SET last_shown_at = now() WHERE id = ANY($1::int[])', [ids]);
+  await db.query(
+    `UPDATE phrases SET last_shown_at = now(),
+       due_at = CASE WHEN due_at IS NOT NULL THEN now() + interval '1 day' - ${DUE_EARLY} END
+     WHERE id = ANY($1::int[])`,
+    [ids],
+  );
 }
 
 /** Adds phrases backdated 14 days so they are eligible at once. Skips the user's exact duplicates. */
@@ -981,12 +1006,49 @@ export async function capacityFacts(db: Db): Promise<{ limitedUsers: number; ave
   return rows[0];
 }
 
-/** Marks the user's phrase as reviewed now, which takes it off Today, or as not reviewed, to undo that. False if it isn't theirs. */
-export async function markReviewed(db: Db, userId: number, phraseId: number, reviewed: boolean): Promise<boolean> {
+/** Days until a phrase comes back, by its box: 2 after "read", then 7, 14, 30, and 60 for each time remembered running. */
+export const REVIEW_INTERVAL_DAYS = [2, 7, 14, 30, 60];
+const TOP_BOX = REVIEW_INTERVAL_DAYS.length - 1;
+
+/**
+ * A phrase is due 12 hours early, so it makes the reminder of the day it's due whatever time
+ * that reminder is: answered at 8 p.m., a phrase due in 2 days is in that day's noon reminder.
+ */
+const DUE_EARLY = "interval '12 hours'";
+
+/**
+ * Answers a phrase on Today: "read" puts it in box 0, back in 2 days; "remembered" moves it up a
+ * box, back in 7, 14, 30, then 60 days. It's off Today from now, and what it was is kept for undo.
+ * Returns its box and the days until it's back, or null if the phrase isn't the user's.
+ */
+export async function reviewPhrase(
+  db: Db,
+  userId: number,
+  phraseId: number,
+  as: 'read' | 'remembered',
+): Promise<{ box: number; days: number } | null> {
+  const box = `CASE WHEN $3 = 'remembered' THEN LEAST(COALESCE(box, 0) + 1, ${TOP_BOX}) ELSE 0 END`;
   const { rows } = await db.query(
-    `UPDATE phrases SET reviewed_at = CASE WHEN $3 THEN now() ELSE NULL END
+    `UPDATE phrases SET
+       undo_box = box,
+       undo_due_at = due_at,
+       box = ${box},
+       due_at = now() + make_interval(days => (ARRAY[${REVIEW_INTERVAL_DAYS.join(', ')}])[${box} + 1]) - ${DUE_EARLY},
+       reviewed_at = now()
+     WHERE id = $1 AND user_id = $2
+     RETURNING box`,
+    [phraseId, userId, as],
+  );
+  if (rows.length === 0) return null;
+  return { box: rows[0].box, days: REVIEW_INTERVAL_DAYS[rows[0].box] };
+}
+
+/** Undoes reviewPhrase: back on Today, with its box and due date as they were. False if the phrase isn't the user's. */
+export async function undoReview(db: Db, userId: number, phraseId: number): Promise<boolean> {
+  const { rows } = await db.query(
+    `UPDATE phrases SET box = undo_box, due_at = undo_due_at, undo_box = NULL, undo_due_at = NULL, reviewed_at = NULL
      WHERE id = $1 AND user_id = $2 RETURNING id`,
-    [phraseId, userId, reviewed],
+    [phraseId, userId],
   );
   return rows.length > 0;
 }

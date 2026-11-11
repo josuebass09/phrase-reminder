@@ -2,7 +2,8 @@ import { PGlite } from '@electric-sql/pglite';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   aiQuotas,
-  markReviewed,
+  reviewPhrase,
+  undoReview,
   cronRunsSince,
   recordCronRun,
   aiUsageSince,
@@ -256,6 +257,99 @@ describe('pickDailyPhrases', () => {
   });
 });
 
+describe('spaced repetition', () => {
+  const HOUR = 3_600_000;
+  async function phrase(text = 'It slipped my mind.') {
+    await insertAged(db, alice.id, text, 20);
+    return (await listRecent(db, alice.id)).find((each) => each.text === text)!.id;
+  }
+  const scheduleOf = async (id: number) =>
+    (await db.query('SELECT box, due_at FROM phrases WHERE id = $1', [id])).rows[0] as { box: number | null; due_at: Date | null };
+  /** Hours from now until it's due. */
+  const hoursUntilDue = async (id: number) => ((await scheduleOf(id)).due_at!.getTime() - Date.now()) / HOUR;
+
+  it('moves a remembered phrase up a box each time, back in 7, 14, 30, then 60 days', async () => {
+    const id = await phrase();
+    const days = [];
+    for (let i = 0; i < 6; i++) days.push((await reviewPhrase(db, alice.id, id, 'remembered'))!.days);
+
+    expect(days).toEqual([7, 14, 30, 60, 60, 60]);
+    expect((await scheduleOf(id)).box).toBe(4);
+  });
+
+  it('puts a phrase that was only read in box 0, back in 2 days, from any box', async () => {
+    const id = await phrase();
+    await reviewPhrase(db, alice.id, id, 'remembered');
+    await reviewPhrase(db, alice.id, id, 'remembered');
+
+    expect(await reviewPhrase(db, alice.id, id, 'read')).toEqual({ box: 0, days: 2 });
+    expect((await scheduleOf(id)).box).toBe(0);
+  });
+
+  it("makes it due 12 hours before the days are up, so it's in that day's reminder at any time", async () => {
+    const id = await phrase();
+
+    await reviewPhrase(db, alice.id, id, 'remembered');
+
+    expect(await hoursUntilDue(id)).toBeCloseTo(7 * 24 - 12, 0);
+  });
+
+  it('puts back the box and due date it had when undone', async () => {
+    const id = await phrase();
+    await reviewPhrase(db, alice.id, id, 'remembered');
+    const before = await scheduleOf(id);
+
+    await reviewPhrase(db, alice.id, id, 'read');
+    expect(await undoReview(db, alice.id, id)).toBe(true);
+
+    expect(await scheduleOf(id)).toEqual(before);
+  });
+
+  it("answers null and false for another user's phrase", async () => {
+    const id = await phrase();
+
+    expect(await reviewPhrase(db, bob.id, id, 'read')).toBeNull();
+    expect(await undoReview(db, bob.id, id)).toBe(false);
+    expect((await scheduleOf(id)).box).toBeNull();
+  });
+
+  it("leaves a scheduled phrase out of the reminder until it's due, and puts the due ones first", async () => {
+    const waiting = await phrase('remembered, not due');
+    const due = await phrase('read, now due');
+    await phrase('never answered');
+    await reviewPhrase(db, alice.id, waiting, 'remembered');
+    await reviewPhrase(db, alice.id, due, 'read');
+    await db.query("UPDATE phrases SET due_at = now() - interval '1 hour' WHERE id = $1", [due]);
+
+    const texts = (await pickDailyPhrases(db, alice.id)).map((p) => p.text);
+
+    expect(texts).toEqual(['read, now due', 'never answered']);
+  });
+
+  it('brings a sent phrase that went unanswered back tomorrow, behind any due longer', async () => {
+    const unanswered = await phrase('sent, not answered');
+    const overdue = await phrase('overdue for days');
+    for (const id of [unanswered, overdue]) await reviewPhrase(db, alice.id, id, 'read');
+    await db.query("UPDATE phrases SET due_at = now() - interval '3 days' WHERE id = $1", [overdue]);
+    await db.query("UPDATE phrases SET due_at = now() - interval '1 hour' WHERE id = $1", [unanswered]);
+
+    await markShown(db, [unanswered]);
+
+    expect(await hoursUntilDue(unanswered)).toBeCloseTo(12, 0); // Tomorrow's reminder, not today's.
+    await db.query("UPDATE phrases SET due_at = due_at - interval '1 day'"); // A day later.
+    expect((await pickDailyPhrases(db, alice.id, 1)).map((p) => p.text)).toEqual(['overdue for days']);
+  });
+
+  it('starts the spacing over when the text changes', async () => {
+    const id = await phrase();
+    await reviewPhrase(db, alice.id, id, 'remembered');
+
+    await updatePhrase(db, alice.id, id, 'It totally slipped my mind.');
+
+    expect(await scheduleOf(id)).toEqual({ box: null, due_at: null });
+  });
+});
+
 describe('listToday', () => {
   it('returns only the latest reminder batch', async () => {
     await insertAged(db, alice.id, 'earlier batch', 30, 2);
@@ -288,7 +382,7 @@ describe('listToday', () => {
     const sent = await listRecent(db, alice.id);
     await markShown(db, sent.map((p) => p.id));
 
-    await markReviewed(db, alice.id, sent.find((p) => p.text === 'first')!.id, true);
+    await reviewPhrase(db, alice.id, sent.find((p) => p.text === 'first')!.id, 'remembered');
 
     expect((await listToday(db, alice.id)).map((p) => p.text)).toEqual(['second']);
   });

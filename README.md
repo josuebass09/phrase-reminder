@@ -105,15 +105,15 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `POST /api/phrases/:id/pronunciation` with a recording as the body, and its type, such as `audio/webm`, as `Content-Type` | Yes | `{ score, words, heard, tip }`: the score from 1 to 10, the phrase's words as `{ text, ok }`, what was heard, and a tip in the user's language. The score is saved as the phrase's `lastScore`. 400 for a body that isn't audio Groq reads, 413 over 1 MB, 422 if nobody spoke, 429 once the user's scores for the day are used up, 502 if Groq fails, 503 without `GROQ_API_KEY` |
 | `GET /api/usage` | Yes | `{ translations, suggestions, pronunciations }`, each `{ used, limit }`: what the user has used today, and the daily limit (`null` for the admin) |
 | `POST /api/activity` with `{ kind }`, and `phraseId` for a phrase kind | Yes | 204, once recorded (see Activity). 400 for an unknown kind, or a phrase with a kind that has none, and 404 for a phrase that isn't the user's |
-| `POST /api/phrases/:id/review` with `{ as }`, `read` or `remembered` | Yes | 204: takes the phrase off Today until a later reminder sends it again, and records the answer (see Activity). Answering again the same day replaces it. 400 for another `as`, 404 for a phrase that isn't the user's |
-| `DELETE /api/phrases/:id/review` | Yes | 204: undoes it, putting the phrase back on Today and forgetting today's answer |
+| `POST /api/phrases/:id/review` with `{ as }`, `read` or `remembered` | Yes | `{ box, days }`: takes the phrase off Today, schedules when it comes back (see Spaced repetition), and records the answer (see Activity). Answering again the same day replaces it. 400 for another `as`, 404 for a phrase that isn't the user's |
+| `DELETE /api/phrases/:id/review` | Yes | 204: undoes it, putting the phrase back on Today, its schedule back as it was, and forgetting today's answer |
 | `POST /api/push/subscribe` with a `PushSubscription` | Yes | 204 |
 | `GET /api/admin/ai` | Admin | Each AI service's requests on each of the last 30 UTC days, what Groq last said is left of its daily quotas, MyMemory's daily characters, and the users' limits (see Admin). 403 for other users |
 | `GET /api/admin/users` | Admin | Every user with their sign-up date, last activity, phrases, devices, open sessions, reminders on or off, and what they used today |
 | `DELETE /api/admin/users/:id/sessions` | Admin | `{ ended }`: logs the user out of every device, keeping their data. 400 for the admin's own account, which uses `DELETE /api/sessions`, and 404 for no such user |
 | `GET /api/admin/system` | Admin | The reminder cron's runs in the last day, its last error, deliveries on each of the last 7 days, the database's size and its biggest tables, and the commits running |
 
-Send the token as `Authorization: Bearer <token>`. It's a JWT signed with `SESSION_SECRET`, and `expiresIn` is its lifetime in seconds (3600). Without a valid token, these requests get a 401. Phrases look like `{ id, text, createdAt, translation, lastScore }`, where `translation` is the saved Spanish, or `null` until someone asks for it, and `lastScore` is the score of the last time the user said it aloud, or `null`. Another user's phrase gets the same 404 as a missing one.
+Send the token as `Authorization: Bearer <token>`. It's a JWT signed with `SESSION_SECRET`, and `expiresIn` is its lifetime in seconds (3600). Without a valid token, these requests get a 401. Phrases look like `{ id, text, createdAt, translation, lastScore, dueAt }`, where `translation` is the saved Spanish, or `null` until someone asks for it, `lastScore` is the score of the last time the user said it aloud, or `null`, and `dueAt` is when spaced repetition has it come back, or `null` until the user first answers it on Today. Another user's phrase gets the same 404 as a missing one.
 
 ## Translations
 
@@ -142,6 +142,17 @@ Whisper is built to understand accents, so the score says how clearly the phrase
 When words were missed, the chat model from Suggestions writes one tip from the difference, such as a short "i" heard as a long "ee"; it never hears the audio. Otherwise the tip is a fixed one, so it costs no request. If the tip fails, the score still comes back with a general tip.
 
 The score is saved with the phrase, and editing the text drops it. The recording is passed on to Groq and never kept. Each user may get 20 scores a day, counted like suggestions: on their local day, a failed one or one with nobody speaking is given back, and the admin has no limit. Set `PRONUNCIATIONS_PER_DAY` to change the 20, and `GROQ_TRANSCRIPTION_MODEL` to use another speech model. Each score takes one speech request, and a chat request when words were missed, from the same free plan as suggestions; with 20 users at 20 a day of each, the chat requests stay under its 1,000 a day.
+
+## Spaced repetition
+
+Each reminder picks phrases at least 14 days old. Once a user swipes one off Today, its answer schedules when it comes back, in boxes:
+
+| Answer | Box | Back in |
+|---|---|---|
+| Read | 0 | 2 days |
+| Remembered | one up, to 4 at most | 7, 14, 30, then 60 days |
+
+So a phrase someone only read comes back soon, and one they keep remembering comes back less and less. A phrase is due 12 hours before its days are up, so it makes that day's reminder whatever the reminder's time. Each reminder takes the due ones first, the longest overdue first, then fills up with phrases never answered, never-shown first and then longest since shown, as before. A scheduled phrase that isn't due waits for its day, so a reminder may have fewer phrases, or none, when little is due. One sent and left unanswered comes back with the next day's reminder, behind any due longer. Undo puts back the box and due date it had, and editing a phrase's text starts its spacing over.
 
 ## Activity
 

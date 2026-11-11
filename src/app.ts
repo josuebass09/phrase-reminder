@@ -40,18 +40,19 @@ import {
   listRecent,
   listToday,
   listUsersForAdmin,
-  markReviewed,
   recordActivity,
   MAX_PHRASE_LENGTH,
   MAX_TRANSLATION_LENGTH,
   normalizeEmail,
   releaseDailyUse,
   reserveDailyUse,
+  reviewPhrase,
   rotateSession,
   saveScore,
   saveSubscription,
   saveTranslation,
   updateSettings,
+  undoReview,
   updatePhrase,
   type ActivityKind,
   type DailyCounter,
@@ -520,8 +521,8 @@ export function createApp({
 
   app.get('/api/today', requireUser, async (c) => c.json(await listToday(db, c.get('user').id)));
 
-  // Swiping a phrase away from Today: it was read, or remembered. Today leaves it out until a
-  // later reminder sends it again, and the activity keeps which, to tell whether reading is enough.
+  // Swiping a phrase away from Today: it was read, or remembered. Today leaves it out, spaced
+  // repetition schedules when it comes back (sooner if only read), and the activity keeps which.
   app.post('/api/phrases/:id/review', requireUser, async (c) => {
     const user = c.get('user');
     const body = await c.req.json().catch(() => null);
@@ -529,18 +530,19 @@ export function createApp({
     const kind = body?.as === 'read' || body?.as === 'remembered' ? REVIEW_KINDS[body.as as 'read' | 'remembered'] : null;
     if (!kind) return c.json({ error: 'as must be read or remembered' }, 400);
     const id = parsePhraseId(c.req.param('id'));
-    if (id === null || !(await markReviewed(db, user.id, id, true))) return c.json({ error: say(c).phraseNotFound }, 404);
+    const next = id === null ? null : await reviewPhrase(db, user.id, id, body.as);
+    if (id === null || !next) return c.json({ error: say(c).phraseNotFound }, 404);
     const day = await userDay(user.id);
     await forgetActivity(db, user.id, day, [...Object.values(REVIEW_KINDS)], id); // One answer a day: the latest.
     await recordActivity(db, user.id, day, kind, id);
-    return c.body(null, 204);
+    return c.json(next); // Its box, and the days until it comes back.
   });
 
-  // Undoing the swipe: back on Today, and today's answer forgotten.
+  // Undoing the swipe: back on Today, its schedule as it was, and today's answer forgotten.
   app.delete('/api/phrases/:id/review', requireUser, async (c) => {
     const user = c.get('user');
     const id = parsePhraseId(c.req.param('id'));
-    if (id === null || !(await markReviewed(db, user.id, id, false))) return c.json({ error: say(c).phraseNotFound }, 404);
+    if (id === null || !(await undoReview(db, user.id, id))) return c.json({ error: say(c).phraseNotFound }, 404);
     await forgetActivity(db, user.id, await userDay(user.id), [...Object.values(REVIEW_KINDS)], id);
     return c.body(null, 204);
   });
