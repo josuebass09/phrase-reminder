@@ -1,6 +1,7 @@
+import { sign } from 'hono/jwt';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../src/app.js';
-import { createAccessToken } from '../src/auth.js';
+import { createAccessToken, hashRefreshToken } from '../src/auth.js';
 import {
   addPhrase,
   listRecent,
@@ -13,7 +14,7 @@ import {
 } from '../src/db.js';
 import { hashPassword } from '../src/passwords.js';
 import { MAX_RECORDING_BYTES, NoSpeechError, type Pronouncer, type Pronunciation } from '../src/pronounce.js';
-import { clearTables, createTestDb, insertAged, insertUser } from './helpers.js';
+import { clearTables, createTestDb, insertAged, insertUser, openSession } from './helpers.js';
 
 const PASSWORD = 'correct horse battery staple';
 const SECRET = 'test-secret-that-is-long-enough-for-hs256';
@@ -32,8 +33,10 @@ function login(body: unknown) {
   });
 }
 
+/** Logs the user in on a new session, as logging in does, without the slow password check. */
 async function bearer(user: User): Promise<string> {
-  return `Bearer ${(await createAccessToken(SECRET, user.id)).token}`;
+  const { sessionId } = await openSession(db, user.id);
+  return `Bearer ${(await createAccessToken(SECRET, user.id, sessionId)).token}`;
 }
 
 /** Sends a request as a user, or with no Authorization header for null. */
@@ -61,7 +64,7 @@ beforeEach(async () => {
 afterEach(() => vi.useRealTimers());
 
 describe('POST /api/login', () => {
-  it('returns a 12-hour access token, its expiry, and the user', async () => {
+  it('returns an hour-long access token, its expiry, a refresh token, and the user', async () => {
     const before = Date.now();
     const response = await login({ email: 'alice@example.com', password: PASSWORD });
     const after = Date.now();
@@ -69,11 +72,12 @@ describe('POST /api/login', () => {
 
     expect(response.status).toBe(200);
     expect(body.user).toEqual({ id: alice.id, email: 'alice@example.com', isAdmin: true });
-    expect(body.expiresIn).toBe(12 * 3600);
-    // Token times are whole seconds, so the expiry can fall up to a second before now + 12 hours.
+    expect(body.expiresIn).toBe(3600);
+    expect(body.refreshToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    // Token times are whole seconds, so the expiry can fall up to a second before now + an hour.
     const expiresAt = new Date(body.expiresAt).getTime();
-    expect(expiresAt).toBeGreaterThan(before + 12 * 3600_000 - 1000);
-    expect(expiresAt).toBeLessThanOrEqual(after + 12 * 3600_000);
+    expect(expiresAt).toBeGreaterThan(before + 3600_000 - 1000);
+    expect(expiresAt).toBeLessThanOrEqual(after + 3600_000);
 
     const me = await app.request('/api/me', { headers: { Authorization: `Bearer ${body.token}` } });
     expect(await me.json()).toEqual({ id: alice.id, email: 'alice@example.com', isAdmin: true });
@@ -110,14 +114,13 @@ describe('POST /api/login', () => {
 });
 
 describe('access tokens', () => {
-  it('stop working after 12 hours', async () => {
-    // Only Date is faked: the in-process database relies on real timers.
-    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-11-10T12:00:00Z') });
+  it('stop working after an hour', async () => {
     const authorization = await bearer(alice);
-
-    vi.setSystemTime(new Date('2026-11-10T23:59:00Z'));
+    // Only Date is faked, and only after the session is open: the in-process database
+    // relies on real timers, and keeps its own clock for the session's end.
+    vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 59 * 60_000 });
     expect((await app.request('/api/me', { headers: { Authorization: authorization } })).status).toBe(200);
-    vi.setSystemTime(new Date('2026-11-11T00:00:01Z'));
+    vi.setSystemTime(Date.now() + 2 * 60_000);
     expect((await app.request('/api/me', { headers: { Authorization: authorization } })).status).toBe(401);
   });
 
@@ -132,7 +135,8 @@ describe('access tokens', () => {
   });
 
   it('must be signed with this server’s secret', async () => {
-    const { token } = await createAccessToken('another-secret-that-is-also-long-enough', alice.id);
+    const { sessionId } = await openSession(db, alice.id);
+    const { token } = await createAccessToken('another-secret-that-is-also-long-enough', alice.id, sessionId);
 
     const response = await app.request('/api/me', { headers: { Authorization: `Bearer ${token}` } });
 
@@ -146,6 +150,138 @@ describe('access tokens', () => {
     const response = await app.request('/api/phrases', { headers: { Authorization: authorization } });
 
     expect(response.status).toBe(401);
+  });
+});
+
+describe('sessions', () => {
+  async function logIn() {
+    return (await login({ email: 'alice@example.com', password: PASSWORD })).json();
+  }
+
+  const refresh = (refreshToken: unknown) =>
+    app.request('/api/session/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken }),
+    });
+
+  const me = (token: string) => app.request('/api/me', { headers: { Authorization: `Bearer ${token}` } });
+
+  const endOf = async (refreshToken: string) =>
+    new Date(
+      (await db.query('SELECT expires_at FROM sessions WHERE token_hash = $1', [hashRefreshToken(refreshToken)])).rows[0]
+        .expires_at,
+    ).getTime();
+
+  it('renew with the refresh token, which gets a new pair and stops working itself', async () => {
+    const first = await logIn();
+
+    const response = await refresh(first.refreshToken);
+    const second = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(second.user).toEqual({ id: alice.id, email: 'alice@example.com', isAdmin: true });
+    expect(second.expiresIn).toBe(3600);
+    expect(second.refreshToken).not.toBe(first.refreshToken);
+    expect((await me(second.token)).status).toBe(200);
+    expect((await me(first.token)).status).toBe(200); // The same session, until its hour is up.
+    expect((await refresh(first.refreshToken)).status).toBe(401);
+    expect((await refresh(second.refreshToken)).status).toBe(200);
+  });
+
+  it('last 60 days from their last renewal', async () => {
+    const { refreshToken } = await logIn();
+    await db.query("UPDATE sessions SET expires_at = now() + interval '1 day'");
+
+    const renewed = await (await refresh(refreshToken)).json();
+
+    const end = await endOf(renewed.refreshToken);
+    expect(end).toBeGreaterThan(Date.now() + 59 * 86_400_000);
+    expect(end).toBeLessThanOrEqual(Date.now() + 60 * 86_400_000 + 1000);
+  });
+
+  it('end once 60 days pass without a renewal, access token included', async () => {
+    const { token, refreshToken } = await logIn();
+    await db.query("UPDATE sessions SET expires_at = now() - interval '1 second'");
+
+    expect((await refresh(refreshToken)).status).toBe(401);
+    expect((await me(token)).status).toBe(401);
+  });
+
+  it('end on logging out, access token included, and logging out needs only the refresh token', async () => {
+    const { token, refreshToken } = await logIn();
+    const other = await logIn();
+
+    const response = await app.request('/api/logout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken }),
+    });
+
+    expect(response.status).toBe(204);
+    expect((await me(token)).status).toBe(401);
+    expect((await refresh(refreshToken)).status).toBe(401);
+    expect((await me(other.token)).status).toBe(200); // Another device stays logged in.
+  });
+
+  it.each([
+    ['an unknown token', JSON.stringify({ refreshToken: 'nope' })],
+    ['no token', '{}'],
+    ['invalid JSON', 'not json'],
+  ])('log out fine with %s', async (_name, body) => {
+    const response = await app.request('/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+
+    expect(response.status).toBe(204);
+  });
+
+  it.each([['an unknown token', 'nope'], ['no token', undefined], ['a number', 42]])(
+    'refuse to renew with %s',
+    async (_name, refreshToken) => {
+      const response = await refresh(refreshToken);
+
+      expect(response.status).toBe(401);
+      expect(await response.json()).toEqual({ error: 'Not logged in' });
+    },
+  );
+
+  it('end when a replaced refresh token comes back over a minute later, as a stolen copy would', async () => {
+    const first = await logIn();
+    const second = await (await refresh(first.refreshToken)).json();
+    await db.query("UPDATE sessions SET rotated_at = now() - interval '2 minutes'");
+
+    expect((await refresh(first.refreshToken)).status).toBe(401);
+
+    expect((await refresh(second.refreshToken)).status).toBe(401);
+    expect((await me(second.token)).status).toBe(401);
+  });
+
+  it('stay open when a replaced refresh token comes back within the minute, as from two windows at once', async () => {
+    const first = await logIn();
+    const second = await (await refresh(first.refreshToken)).json();
+
+    expect((await refresh(first.refreshToken)).status).toBe(401);
+
+    expect((await refresh(second.refreshToken)).status).toBe(200);
+  });
+
+  it('all end for the user, and only them, on DELETE /api/sessions', async () => {
+    const phone = await logIn();
+    const laptop = await logIn();
+    const bobs = await bearer(bob);
+
+    const response = await app.request('/api/sessions', { method: 'DELETE', headers: { Authorization: `Bearer ${phone.token}` } });
+
+    expect(response.status).toBe(204);
+    expect((await me(phone.token)).status).toBe(401);
+    expect((await me(laptop.token)).status).toBe(401);
+    expect((await refresh(laptop.refreshToken)).status).toBe(401);
+    expect((await app.request('/api/me', { headers: { Authorization: bobs } })).status).toBe(200);
+  });
+
+  it('accept access tokens from before sessions until they expire', async () => {
+    const old = await sign({ sub: String(alice.id), iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 60 }, SECRET, 'HS256');
+
+    expect((await me(old)).status).toBe(200);
   });
 });
 
@@ -1063,13 +1199,14 @@ describe('POST /api/signup', () => {
 
   const emails = async () => (await listUsers(db)).map((user) => user.email);
 
-  it('creates a regular account and logs it in for 12 hours', async () => {
+  it('creates a regular account and logs it in, with a session to renew', async () => {
     const response = await signup({ email: '  Carol@Example.com ', password: PASSWORD_FOR_NEW, code: await invite() });
     const body = await response.json();
 
     expect(response.status).toBe(201);
     expect(body.user).toEqual({ id: expect.any(Number), email: 'carol@example.com', isAdmin: false });
-    expect(body.expiresIn).toBe(12 * 3600);
+    expect(body.refreshToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(body.expiresIn).toBe(3600);
     const me = await app.request('/api/me', { headers: { Authorization: `Bearer ${body.token}` } });
     expect(await me.json()).toEqual(body.user);
     expect((await login({ email: 'carol@example.com', password: PASSWORD_FOR_NEW })).status).toBe(200);

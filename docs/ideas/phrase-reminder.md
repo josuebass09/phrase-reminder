@@ -20,7 +20,7 @@ Stack: TypeScript on Node, Hono, Railway Postgres, a Railway cron service, and W
 
 ## MVP Scope
 **In:**
-- Input page with a Today section (the latest reminder's phrases), a recent-phrases list, and a single password (1-year signed cookie). Later replaced by an app with user accounts: email and password, 12-hour access tokens, users sign up in the app with a single-use invite link from the admin, or are created from a terminal
+- Input page with a Today section (the latest reminder's phrases), a recent-phrases list, and a single password (1-year signed cookie). Later replaced by an app with user accounts: email and password, 12-hour access tokens (later sessions that last until 60 days without use), users sign up in the app with a single-use invite link from the admin, or are created from a terminal
 - `phrases` and `push_subscriptions` tables
 - Button to turn on reminders on each device
 - Daily push notification at 12:00 Costa Rica time. Later made a per-user setting: time, number of phrases, and pause, in the user's own time zone

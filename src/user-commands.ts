@@ -1,6 +1,8 @@
 import {
   claimUnowned,
   createUser,
+  endAllSessions,
+  endUserSessions,
   findUserByEmail,
   isValidEmail,
   listUsers,
@@ -12,7 +14,9 @@ import { checkNewPassword, hashPassword } from './passwords.js';
 export const USAGE = `Usage:
   npm run users -- add <email>            Create a user. Asks for the password.
   npm run users -- set-password <email>   Change a user's password. Asks for the new one.
-  npm run users -- list                   List users.`;
+  npm run users -- list                   List users.
+  npm run users -- log-out <email>        Log a user out of every device.
+  npm run users -- log-out --all          Log everyone out.`;
 
 /** A problem to report in one line, without a stack trace. */
 export class CommandError extends Error {}
@@ -57,12 +61,29 @@ export async function runUsersCommand(db: Db, args: string[], io: CommandIO): Pr
     if (!user) throw new CommandError(`No user with the email ${email}`);
 
     await setPasswordHash(db, user.id, await hashPassword(await readValidPassword(io)));
-    io.log(`Changed the password for ${user.email}. Devices already logged in stay so until their token expires.`);
+    // Whoever knew the old password may still be logged in somewhere.
+    const ended = await endUserSessions(db, user.id);
+    io.log(`Changed the password for ${user.email} and logged them out of ${devices(ended)}.`);
+    return;
+  }
+
+  if (command === 'log-out' && email === '--all') {
+    io.log(`Logged everyone out of ${devices(await endAllSessions(db))}.`);
+    return;
+  }
+
+  if (command === 'log-out' && email) {
+    const user = await findUserByEmail(db, email);
+    if (!user) throw new CommandError(`No user with the email ${email}`);
+
+    io.log(`Logged ${user.email} out of ${devices(await endUserSessions(db, user.id))}.`);
     return;
   }
 
   throw new CommandError(USAGE);
 }
+
+const devices = (count: number) => (count === 1 ? '1 device' : `${count} devices`);
 
 async function readValidPassword(io: CommandIO): Promise<string> {
   const password = await io.readNewPassword();

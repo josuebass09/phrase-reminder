@@ -159,6 +159,21 @@ export async function ensureSchema(db: Db): Promise<void> {
   await db.query('CREATE INDEX IF NOT EXISTS push_subscriptions_user_id ON push_subscriptions (user_id)');
   // The score, from 1 to 10, of the last time the user said the phrase aloud. The recording isn't kept.
   await db.query('ALTER TABLE phrases ADD COLUMN IF NOT EXISTS last_score SMALLINT');
+  // One row per login, kept while the app uses it (see auth.ts). Only hashes of refresh
+  // tokens are kept; the one each refresh replaced stays a while to notice it coming back.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id            SERIAL PRIMARY KEY,
+      user_id       INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+      token_hash    TEXT NOT NULL UNIQUE,
+      previous_hash TEXT,
+      rotated_at    TIMESTAMPTZ,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at    TIMESTAMPTZ NOT NULL
+    )
+  `);
+  await db.query('CREATE INDEX IF NOT EXISTS sessions_user_id ON sessions (user_id)');
+  await db.query('CREATE INDEX IF NOT EXISTS sessions_previous_hash ON sessions (previous_hash)');
 }
 
 /** Emails are compared trimmed and lowercased, so "Me@Example.com " finds me@example.com. */
@@ -263,6 +278,81 @@ export async function finishInvite(db: Db, id: number, userId: number | null): P
       : 'UPDATE invites SET used_by = $2 WHERE id = $1',
     userId === null ? [id] : [id, userId],
   );
+}
+
+/** A session lasts this long after the app last renewed it, so only one unused this long logs out. */
+export const SESSION_LIFETIME_DAYS = 60;
+
+/** Opens a session for a login, and clears the user's ones that ran out. */
+export async function createSession(db: Db, userId: number, tokenHash: string): Promise<number> {
+  await db.query('DELETE FROM sessions WHERE user_id = $1 AND expires_at <= now()', [userId]);
+  const { rows } = await db.query(
+    `INSERT INTO sessions (user_id, token_hash, expires_at)
+     VALUES ($1, $2, now() + make_interval(days => $3))
+     RETURNING id`,
+    [userId, tokenHash, SESSION_LIFETIME_DAYS],
+  );
+  return rows[0].id;
+}
+
+/**
+ * Swaps a session's refresh token for a new one and pushes back its end, in one
+ * statement, so the same token can't renew it twice. Returns the session, or null
+ * if no live session has that token.
+ */
+export async function rotateSession(
+  db: Db,
+  tokenHash: string,
+  newTokenHash: string,
+): Promise<{ id: number; userId: number } | null> {
+  const { rows } = await db.query(
+    `UPDATE sessions
+     SET previous_hash = token_hash, token_hash = $2, rotated_at = now(),
+         expires_at = now() + make_interval(days => $3)
+     WHERE token_hash = $1 AND expires_at > now()
+     RETURNING id, user_id AS "userId"`,
+    [tokenHash, newTokenHash, SESSION_LIFETIME_DAYS],
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Ends the session whose refresh token was already replaced, if it comes back more
+ * than a minute later: someone else may have a copy. Within the minute, it's more
+ * likely two of the app's windows renewing at once, and the session stays.
+ */
+export async function endSessionIfReused(db: Db, tokenHash: string): Promise<void> {
+  await db.query(
+    "DELETE FROM sessions WHERE previous_hash = $1 AND rotated_at < now() - interval '1 minute'",
+    [tokenHash],
+  );
+}
+
+export async function endSessionByToken(db: Db, tokenHash: string): Promise<void> {
+  await db.query('DELETE FROM sessions WHERE token_hash = $1', [tokenHash]);
+}
+
+/** Logs the user out of every device. Returns how many sessions ended. */
+export async function endUserSessions(db: Db, userId: number): Promise<number> {
+  const { rows } = await db.query('DELETE FROM sessions WHERE user_id = $1 RETURNING id', [userId]);
+  return rows.length;
+}
+
+/** Logs everyone out. Returns how many sessions ended. */
+export async function endAllSessions(db: Db): Promise<number> {
+  const { rows } = await db.query('DELETE FROM sessions RETURNING id');
+  return rows.length;
+}
+
+/** The user, if that session is theirs and still open. */
+export async function findUserInSession(db: Db, userId: number, sessionId: number): Promise<User | null> {
+  const { rows } = await db.query(
+    `SELECT u.id, u.email, u.is_admin AS "isAdmin"
+     FROM users u JOIN sessions s ON s.user_id = u.id
+     WHERE u.id = $1 AND s.id = $2 AND s.expires_at > now()`,
+    [userId, sessionId],
+  );
+  return rows[0] ?? null;
 }
 
 export async function getSettings(db: Db, userId: number): Promise<ReminderSettings | null> {

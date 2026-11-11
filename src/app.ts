@@ -3,15 +3,26 @@ import { cors } from 'hono/cors';
 import { createMiddleware } from 'hono/factory';
 import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
-import { ACCESS_TOKEN_LIFETIME_SECONDS, createAccessToken, readAccessToken } from './auth.js';
+import {
+  ACCESS_TOKEN_LIFETIME_SECONDS,
+  createAccessToken,
+  hashRefreshToken,
+  newRefreshToken,
+  readAccessToken,
+} from './auth.js';
 import {
   addPhrase,
   claimInvite,
   createInvite,
+  createSession,
   createUser,
   dailyUses,
   deletePhrase,
+  endSessionByToken,
+  endSessionIfReused,
+  endUserSessions,
   findUser,
+  findUserInSession,
   findPhraseTranslation,
   findUserByEmail,
   finishInvite,
@@ -25,6 +36,7 @@ import {
   normalizeEmail,
   releaseDailyUse,
   reserveDailyUse,
+  rotateSession,
   saveScore,
   saveSubscription,
   saveTranslation,
@@ -77,6 +89,11 @@ export const DEFAULT_PRONUNCIATIONS_PER_DAY = 20;
 const NO_LIMIT = 2_147_483_647;
 
 type AppEnv = { Variables: { user: User } };
+
+/** The refresh token from a JSON body, or an empty string. */
+function refreshTokenOf(body: any): string {
+  return typeof body?.refreshToken === 'string' ? body.refreshToken : '';
+}
 
 /** Reads a browser's PushSubscription JSON. Push endpoints must be HTTPS. */
 function parseSubscription(body: any): DeviceSubscription | null {
@@ -189,25 +206,37 @@ export function createApp({
     return (await reserveDailyUse(db, user.id, counter, day, limit)) ? day : null;
   }
 
-  /** The body for a new session, the same after logging in and after signing up. */
-  async function sessionFor(user: User) {
-    const { token, expiresAt } = await createAccessToken(tokenSecret, user.id);
+  /** The body with a session's tokens: a new access token, and the refresh token to renew it with. */
+  async function tokensFor(user: User, sessionId: number, refreshToken: string) {
+    const { token, expiresAt } = await createAccessToken(tokenSecret, user.id, sessionId);
     return {
       token,
       expiresAt: expiresAt.toISOString(),
       // Seconds from now, for clients whose clock may be off.
       expiresIn: ACCESS_TOKEN_LIFETIME_SECONDS,
+      refreshToken,
       user: { id: user.id, email: user.email, isAdmin: user.isAdmin },
     };
   }
 
-  // The user must still exist: deleting one locks out their tokens at once.
+  /** Opens a session after logging in or signing up. */
+  async function sessionFor(user: User) {
+    const refreshToken = newRefreshToken();
+    return tokensFor(user, await createSession(db, user.id, hashRefreshToken(refreshToken)), refreshToken);
+  }
+
+  // The session must still be open, and its user must still exist: logging out, or
+  // deleting the user, locks out their tokens at once.
   const requireUser = createMiddleware<AppEnv>(async (c, next) => {
     const authorization = c.req.header('authorization') ?? '';
-    const userId = authorization.startsWith('Bearer ')
+    const claims = authorization.startsWith('Bearer ')
       ? await readAccessToken(tokenSecret, authorization.slice(7))
       : null;
-    const user = userId === null ? null : await findUser(db, userId);
+    const user = !claims
+      ? null
+      : claims.sessionId === null
+        ? await findUser(db, claims.userId)
+        : await findUserInSession(db, claims.userId, claims.sessionId);
     if (!user) return c.json({ error: say(c).notLoggedIn }, 401);
     c.set('user', user);
     await next();
@@ -281,6 +310,35 @@ export function createApp({
     await finishInvite(db, inviteId, user.id);
 
     return c.json(await sessionFor(user), 201);
+  });
+
+  // Swaps the refresh token for a new pair. A 401 means the session is over: it ran out,
+  // the user logged out, or the token was already used.
+  app.post('/api/session/refresh', async (c) => {
+    const refreshToken = refreshTokenOf(await c.req.json().catch(() => null));
+    const tokenHash = refreshToken ? hashRefreshToken(refreshToken) : '';
+    const next = newRefreshToken();
+    const session = tokenHash ? await rotateSession(db, tokenHash, hashRefreshToken(next)) : null;
+    const user = session ? await findUser(db, session.userId) : null;
+    if (!session || !user) {
+      if (tokenHash) await endSessionIfReused(db, tokenHash);
+      return c.json({ error: say(c).notLoggedIn }, 401);
+    }
+    return c.json(await tokensFor(user, session.id, next));
+  });
+
+  // Ends the session the refresh token belongs to. It needs no access token, so logging
+  // out works even after that one ran out. Unknown tokens are fine: the session is over either way.
+  app.post('/api/logout', async (c) => {
+    const refreshToken = refreshTokenOf(await c.req.json().catch(() => null));
+    if (refreshToken) await endSessionByToken(db, hashRefreshToken(refreshToken));
+    return c.body(null, 204);
+  });
+
+  // Logs the user out of every device, this one included.
+  app.delete('/api/sessions', requireUser, async (c) => {
+    await endUserSessions(db, c.get('user').id);
+    return c.body(null, 204);
   });
 
   // Returns the code once. Only its hash is stored, so it can't be shown again.

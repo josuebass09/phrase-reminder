@@ -42,7 +42,7 @@ Railway deploys from this repository, so push it to GitHub first. All settings b
    - Cron schedule: `*/15 * * * *`
    - Variables: `DATABASE_URL` (reference the Postgres service), `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`
 
-Generate `SESSION_SECRET` with `openssl rand -base64 32`. It signs the access tokens, must be at least 32 characters, and changing it logs out every device.
+Generate `SESSION_SECRET` with `openssl rand -base64 32`. It signs the access tokens and must be at least 32 characters. Changing it doesn't log anyone out, since the app renews its tokens; to do that, see Users.
 
 Then create the users, as described below. Set `VAPID_SUBJECT` to a contact address with no spaces, such as `mailto:you@example.com`.
 
@@ -66,13 +66,17 @@ You can also manage users from a terminal. To do it on Railway, set `DATABASE_UR
 npm run users -- add you@example.com            # Asks for the password twice
 npm run users -- set-password you@example.com   # Asks for the new one
 npm run users -- list                           # Each user with their phrase and device counts
+npm run users -- log-out you@example.com        # Logs them out of every device
+npm run users -- log-out --all                  # Logs everyone out
 ```
 
 Passwords need 12 to 200 characters and are stored as scrypt hashes. Emails are case-insensitive.
 
 The first user gets the phrases and devices saved before accounts existed. Until then, the API shows them to nobody and the reminder job skips them.
 
-Logging in gives an access token that lasts 12 hours, then the app asks to log in again. Changing a password doesn't end sessions already open; they last until their token expires. To end every session at once, change `SESSION_SECRET`.
+Logging in opens a session, which lasts while the app keeps using it: the app stays logged in until 60 days pass without it opening, or the person logs out. The app holds two tokens for it. The access token lasts an hour and names the session, which must still be open, so logging out ends it at once. The refresh token gets the app a new pair, and each use replaces it with a new one; the database keeps only a hash of it. If a refresh token that was already replaced comes back more than a minute later, someone may have a copy, so that session ends. Within the minute it's more likely two of the app's windows renewing at once, and the session stays.
+
+Changing a password logs that user out of every device, in case someone else knew the old one. In the app, Settings can log the person out of this device or of every device.
 
 ## API for the app
 
@@ -81,8 +85,11 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | Request | Token | Response |
 |---|---|---|
 | `GET /api/config` | No | `{ vapidPublicKey }` |
-| `POST /api/login` with `{ email, password }` | No | `{ token, expiresAt, expiresIn, user }`, 401 for a wrong email or password, or 400 if one is missing |
+| `POST /api/login` with `{ email, password }` | No | `{ token, expiresAt, expiresIn, refreshToken, user }`, 401 for a wrong email or password, or 400 if one is missing |
 | `POST /api/signup` with `{ email, password, code }` | No | The same as a login, 201. 403 if the invite is unknown, used, or expired, 409 if the email has an account, 400 for an invalid email or password |
+| `POST /api/session/refresh` with `{ refreshToken }` | No | The same as a login, with a new refresh token in place of that one. 401 if the session is over: it ran out, was logged out, or that token was already used |
+| `POST /api/logout` with `{ refreshToken }` | No | 204, and that session ends. It needs no access token, so it works after that one ran out |
+| `DELETE /api/sessions` | Yes | 204, and every one of the user's sessions ends, this one included |
 | `POST /api/invites` | Admin | `{ code, expiresAt }`, 201. 403 for other users |
 | `GET /api/me` | Yes | `{ id, email, isAdmin }` |
 | `GET /api/settings` | Yes | `{ remindersOn, reminderTime, timeZone, phrasesPerDay, language }`; `language` is `null` until the app saves one |
@@ -98,7 +105,7 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `GET /api/usage` | Yes | `{ translations, suggestions, pronunciations }`, each `{ used, limit }`: what the user has used today, and the daily limit (`null` for the admin) |
 | `POST /api/push/subscribe` with a `PushSubscription` | Yes | 204 |
 
-Send the token as `Authorization: Bearer <token>`. It's a JWT signed with `SESSION_SECRET`, and `expiresIn` is its lifetime in seconds (43200). Without a valid token, these requests get a 401. Phrases look like `{ id, text, createdAt, lastScore }`, where `lastScore` is the score of the last time the user said it aloud, or `null`. Another user's phrase gets the same 404 as a missing one.
+Send the token as `Authorization: Bearer <token>`. It's a JWT signed with `SESSION_SECRET`, and `expiresIn` is its lifetime in seconds (3600). Without a valid token, these requests get a 401. Phrases look like `{ id, text, createdAt, lastScore }`, where `lastScore` is the score of the last time the user said it aloud, or `null`. Another user's phrase gets the same 404 as a missing one.
 
 ## Translations
 

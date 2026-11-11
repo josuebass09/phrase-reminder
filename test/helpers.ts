@@ -1,5 +1,6 @@
 import { PGlite } from '@electric-sql/pglite';
-import { createUser, ensureSchema, type Db, type User } from '../src/db.js';
+import { hashRefreshToken, newRefreshToken } from '../src/auth.js';
+import { createSession, createUser, ensureSchema, type Db, type User } from '../src/db.js';
 
 /** A real Postgres engine running in-process, so the tests exercise the actual SQL. */
 export async function createTestDb(): Promise<Db> {
@@ -10,7 +11,7 @@ export async function createTestDb(): Promise<Db> {
 }
 
 export async function clearTables(db: Db): Promise<void> {
-  await db.query('TRUNCATE users, invites, phrases, push_subscriptions RESTART IDENTITY CASCADE');
+  await db.query('TRUNCATE users, invites, phrases, push_subscriptions, sessions RESTART IDENTITY CASCADE');
 }
 
 /** Hashing is slow on purpose, so tests that don't log in skip it. */
@@ -31,4 +32,10 @@ export async function insertAged(
      VALUES ($1, $2, now() - interval '${daysOld} days', ${shown})`,
     [userId, text],
   );
+}
+
+/** Opens a session as logging in does, and returns it with its refresh token. */
+export async function openSession(db: Db, userId: number): Promise<{ sessionId: number; refreshToken: string }> {
+  const refreshToken = newRefreshToken();
+  return { sessionId: await createSession(db, userId, hashRefreshToken(refreshToken)), refreshToken };
 }

@@ -2,7 +2,7 @@ import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { findUserByEmail, listRecent, type Db } from '../src/db.js';
 import { verifyPassword } from '../src/passwords.js';
 import { CommandError, runUsersCommand, USAGE } from '../src/user-commands.js';
-import { clearTables, createTestDb, insertAged, insertUser } from './helpers.js';
+import { clearTables, createTestDb, insertAged, insertUser, openSession } from './helpers.js';
 
 const PASSWORD = 'a long enough password';
 
@@ -16,6 +16,14 @@ function run(args: string[], password = PASSWORD) {
 beforeAll(async () => {
   db = await createTestDb();
 });
+
+/** Open sessions by user id, for each user. */
+async function sessionCount(): Promise<Record<number, number>> {
+  const { rows } = await db.query(
+    'SELECT u.id, count(s.id)::int AS sessions FROM users u LEFT JOIN sessions s ON s.user_id = u.id GROUP BY u.id',
+  );
+  return Object.fromEntries(rows.map((row) => [row.id, row.sessions]));
+}
 
 beforeEach(async () => {
   await clearTables(db);
@@ -81,6 +89,49 @@ describe('npm run users -- set-password', () => {
 
   it('refuses an unknown email', async () => {
     await expect(run(['set-password', 'nobody@example.com'])).rejects.toThrow('No user with the email nobody@example.com');
+  });
+
+  it('logs the user out of every device, since someone may know the old password', async () => {
+    const user = await insertUser(db, 'me@example.com');
+    const friend = await insertUser(db, 'friend@example.com');
+    await openSession(db, user.id);
+    await openSession(db, user.id);
+    await openSession(db, friend.id);
+
+    await run(['set-password', 'me@example.com'], 'a brand new password');
+
+    expect(lines.at(-1)).toBe('Changed the password for me@example.com and logged them out of 2 devices.');
+    expect(await sessionCount()).toEqual({ [user.id]: 0, [friend.id]: 1 });
+  });
+});
+
+describe('npm run users -- log-out', () => {
+  it('logs one user out of every device', async () => {
+    const user = await insertUser(db, 'me@example.com');
+    const friend = await insertUser(db, 'friend@example.com');
+    await openSession(db, user.id);
+    await openSession(db, friend.id);
+
+    await run(['log-out', 'Me@Example.com']);
+
+    expect(lines).toEqual(['Logged me@example.com out of 1 device.']);
+    expect(await sessionCount()).toEqual({ [user.id]: 0, [friend.id]: 1 });
+  });
+
+  it('logs everyone out with --all', async () => {
+    const user = await insertUser(db, 'me@example.com');
+    const friend = await insertUser(db, 'friend@example.com');
+    await openSession(db, user.id);
+    await openSession(db, friend.id);
+
+    await run(['log-out', '--all']);
+
+    expect(lines).toEqual(['Logged everyone out of 2 devices.']);
+    expect(await sessionCount()).toEqual({ [user.id]: 0, [friend.id]: 0 });
+  });
+
+  it('refuses an unknown email', async () => {
+    await expect(run(['log-out', 'nobody@example.com'])).rejects.toThrow('No user with the email nobody@example.com');
   });
 });
 
