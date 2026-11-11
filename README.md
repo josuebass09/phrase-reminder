@@ -68,6 +68,7 @@ npm run users -- set-password you@example.com   # Asks for the new one
 npm run users -- list                           # Each user with their phrase and device counts
 npm run users -- log-out you@example.com        # Logs them out of every device
 npm run users -- log-out --all                  # Logs everyone out
+npm run users -- stats                          # Each user's activity by week (see Activity)
 ```
 
 Passwords need 12 to 200 characters and are stored as scrypt hashes. Emails are case-insensitive.
@@ -103,6 +104,7 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `POST /api/suggestions` with `{ text }`, and optionally `context` | Yes | `{ formal, informal }`, each `{ text }`: two ways to say the text in English. `context` (up to 300 characters) says who it's for, where, or what it's about, so the options fit. Saves nothing. 429 once the user's suggestions for the day are used up, 502 if the AI fails, 503 without `GROQ_API_KEY` |
 | `POST /api/phrases/:id/pronunciation` with a recording as the body, and its type, such as `audio/webm`, as `Content-Type` | Yes | `{ score, words, heard, tip }`: the score from 1 to 10, the phrase's words as `{ text, ok }`, what was heard, and a tip in the user's language. The score is saved as the phrase's `lastScore`. 400 for a body that isn't audio Groq reads, 413 over 1 MB, 422 if nobody spoke, 429 once the user's scores for the day are used up, 502 if Groq fails, 503 without `GROQ_API_KEY` |
 | `GET /api/usage` | Yes | `{ translations, suggestions, pronunciations }`, each `{ used, limit }`: what the user has used today, and the daily limit (`null` for the admin) |
+| `POST /api/activity` with `{ kind }`, and `phraseId` for a phrase kind | Yes | 204, once recorded (see Activity). 400 for an unknown kind, or a phrase with a kind that has none, and 404 for a phrase that isn't the user's |
 | `POST /api/push/subscribe` with a `PushSubscription` | Yes | 204 |
 
 Send the token as `Authorization: Bearer <token>`. It's a JWT signed with `SESSION_SECRET`, and `expiresIn` is its lifetime in seconds (3600). Without a valid token, these requests get a 401. Phrases look like `{ id, text, createdAt, lastScore }`, where `lastScore` is the score of the last time the user said it aloud, or `null`. Another user's phrase gets the same 404 as a missing one.
@@ -134,6 +136,14 @@ Whisper is built to understand accents, so the score says how clearly the phrase
 When words were missed, the chat model from Suggestions writes one tip from the difference, such as a short "i" heard as a long "ee"; it never hears the audio. Otherwise the tip is a fixed one, so it costs no request. If the tip fails, the score still comes back with a general tip.
 
 The score is saved with the phrase, and editing the text drops it. The recording is passed on to Groq and never kept. Each user may get 20 scores a day, counted like suggestions: on their local day, a failed one or one with nobody speaking is given back, and the admin has no limit. Set `PRONUNCIATIONS_PER_DAY` to change the 20, and `GROQ_TRANSCRIPTION_MODEL` to use another speech model. Each score takes one speech request, and a chat request when words were missed, from the same free plan as suggestions; with 20 users at 20 a day of each, the chat requests stay under its 1,000 a day.
+
+## Activity
+
+To tell whether the reminders help, as `docs/ideas/phrase-reminder.md` asks, the backend records what each user did on each of their local days: that a reminder reached a device, and that the user opened the app from it, looked at Today, or heard, translated, or said aloud a phrase. Each counts once a day, or once a day per phrase, however often it happens, so the table stays small. It keeps the day and the phrase's id, never its text or a recording, and it goes when the user's account does.
+
+The backend records reminders sent and phrases said aloud itself. The app reports the rest with `POST /api/activity`, where `kind` is `reminder_opened` or `today_viewed`, or `phrase_heard` or `phrase_translated` with the phrase's id.
+
+`npm run users -- stats` shows each user's last 4 weeks, from Monday, one line a week: the days a reminder reached a device, the days the user opened the app from it, the days they looked at Today, and how many different phrases they practiced. Add a number for more weeks, up to 52, such as `npm run users -- stats 12`. The notification shows the phrases themselves, so someone can read them without opening the app: the days opened are the least they read, not all of it.
 
 ## Import your current file
 

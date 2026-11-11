@@ -174,6 +174,23 @@ export async function ensureSchema(db: Db): Promise<void> {
   `);
   await db.query('CREATE INDEX IF NOT EXISTS sessions_user_id ON sessions (user_id)');
   await db.query('CREATE INDEX IF NOT EXISTS sessions_previous_hash ON sessions (previous_hash)');
+  // What each user did on each of their local days, to tell whether the reminders help:
+  // one row per kind a day, and per phrase for the phrase ones. No text or audio is kept.
+  // phrase_id has no foreign key, so a deleted phrase still counts in the days it was practiced.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS activity (
+      user_id    INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+      day        TEXT NOT NULL,
+      kind       TEXT NOT NULL,
+      phrase_id  INTEGER,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+  // Two partial indexes, since a unique index counts NULLs as different from each other.
+  await db.query('CREATE UNIQUE INDEX IF NOT EXISTS activity_daily ON activity (user_id, day, kind) WHERE phrase_id IS NULL');
+  await db.query(
+    'CREATE UNIQUE INDEX IF NOT EXISTS activity_daily_phrase ON activity (user_id, day, kind, phrase_id) WHERE phrase_id IS NOT NULL',
+  );
 }
 
 /** Emails are compared trimmed and lowercased, so "Me@Example.com " finds me@example.com. */
@@ -391,6 +408,63 @@ export async function listReminderCandidates(db: Db): Promise<ReminderCandidate[
     WHERE reminders_on AND EXISTS (SELECT 1 FROM push_subscriptions s WHERE s.user_id = u.id)
     ORDER BY id
   `);
+  return rows;
+}
+
+/**
+ * What gets recorded about a user's day. The backend records reminder_sent and phrase_scored
+ * itself; the app reports the rest (see PHRASE_ACTIVITY and DAY_ACTIVITY in app.ts).
+ */
+export type ActivityKind =
+  | 'reminder_sent'
+  | 'reminder_opened'
+  | 'today_viewed'
+  | 'phrase_heard'
+  | 'phrase_translated'
+  | 'phrase_scored';
+
+/** Records that the user did this on their local day. Doing it again the same day changes nothing. */
+export async function recordActivity(
+  db: Db,
+  userId: number,
+  day: string,
+  kind: ActivityKind,
+  phraseId: number | null = null,
+): Promise<void> {
+  await db.query(
+    'INSERT INTO activity (user_id, day, kind, phrase_id) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+    [userId, day, kind, phraseId],
+  );
+}
+
+/** One user's week, from Monday: days with each thing, and the phrases they practiced. */
+export interface WeekActivity {
+  email: string;
+  /** The Monday, as YYYY-MM-DD. */
+  week: string;
+  remindersSent: number;
+  remindersOpened: number;
+  todayViewed: number;
+  /** Different phrases heard, translated, or said aloud. */
+  phrasesPracticed: number;
+}
+
+/** Each user's activity for the weeks that began within the last `weeks` weeks, oldest first. */
+export async function weeklyActivity(db: Db, weeks: number): Promise<WeekActivity[]> {
+  const { rows } = await db.query(
+    `SELECT u.email,
+       to_char(date_trunc('week', a.day::date), 'YYYY-MM-DD') AS week,
+       (count(DISTINCT a.day) FILTER (WHERE a.kind = 'reminder_sent'))::int AS "remindersSent",
+       (count(DISTINCT a.day) FILTER (WHERE a.kind = 'reminder_opened'))::int AS "remindersOpened",
+       (count(DISTINCT a.day) FILTER (WHERE a.kind = 'today_viewed'))::int AS "todayViewed",
+       (count(DISTINCT a.phrase_id) FILTER (WHERE a.kind IN ('phrase_heard', 'phrase_translated', 'phrase_scored')))::int
+         AS "phrasesPracticed"
+     FROM activity a JOIN users u ON u.id = a.user_id
+     WHERE date_trunc('week', a.day::date) > date_trunc('week', current_date) - make_interval(weeks => $1)
+     GROUP BY u.email, week
+     ORDER BY u.email, week`,
+    [weeks],
+  );
   return rows;
 }
 

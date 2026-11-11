@@ -4,6 +4,7 @@ import {
   listSubscriptions,
   markShown,
   pickDailyPhrases,
+  recordActivity,
   setLastReminderDay,
   type Db,
   type DeviceSubscription,
@@ -82,6 +83,7 @@ export async function sendDueReminders(db: Db, send: PushSender, now = new Date(
     if (delivered > 0) {
       await markShown(db, phrases.map((phrase) => phrase.id));
       await setLastReminderDay(db, userId, day);
+      await recordActivity(db, userId, day, 'reminder_sent');
     }
   }
   return result;

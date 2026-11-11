@@ -7,6 +7,7 @@ import {
   isValidEmail,
   listUsers,
   setPasswordHash,
+  weeklyActivity,
   type Db,
 } from './db.js';
 import { checkNewPassword, hashPassword } from './passwords.js';
@@ -16,7 +17,8 @@ export const USAGE = `Usage:
   npm run users -- set-password <email>   Change a user's password. Asks for the new one.
   npm run users -- list                   List users.
   npm run users -- log-out <email>        Log a user out of every device.
-  npm run users -- log-out --all          Log everyone out.`;
+  npm run users -- log-out --all          Log everyone out.
+  npm run users -- stats [weeks]          Each user's activity by week, for the last 4 weeks or as many as given.`;
 
 /** A problem to report in one line, without a stack trace. */
 export class CommandError extends Error {}
@@ -37,6 +39,26 @@ export async function runUsersCommand(db: Db, args: string[], io: CommandIO): Pr
     for (const user of users) {
       const role = user.isAdmin ? '\tadmin' : '';
       io.log(`${user.id}\t${user.email}\t${user.phrases} phrases\t${user.devices} devices${role}`);
+    }
+    return;
+  }
+
+  if (command === 'stats') {
+    const weeks = email === undefined ? 4 : Number(email);
+    if (!Number.isInteger(weeks) || weeks < 1 || weeks > 52) throw new CommandError('Give the weeks as a whole number from 1 to 52');
+    const rows = await weeklyActivity(db, weeks);
+    if (rows.length === 0) io.log(`No activity in the last ${weeks === 1 ? 'week' : `${weeks} weeks`}.`);
+    for (const row of rows) {
+      io.log(
+        [
+          row.email,
+          `week of ${row.week}`,
+          `${row.remindersSent} reminders`,
+          `${row.remindersOpened} opened`,
+          `${row.todayViewed} days with Today`,
+          `${row.phrasesPracticed} phrases practiced`,
+        ].join('\t'),
+      );
     }
     return;
   }

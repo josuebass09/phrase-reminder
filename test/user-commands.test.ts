@@ -1,5 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { findUserByEmail, listRecent, type Db } from '../src/db.js';
+import { findUserByEmail, listRecent, recordActivity, type Db } from '../src/db.js';
 import { verifyPassword } from '../src/passwords.js';
 import { CommandError, runUsersCommand, USAGE } from '../src/user-commands.js';
 import { clearTables, createTestDb, insertAged, insertUser, openSession } from './helpers.js';
@@ -161,4 +161,58 @@ it.each([[['delete', 'me@example.com']], [['add']], [['list', 'extra']]])('shows
 
   await expect(attempt).rejects.toBeInstanceOf(CommandError);
   await expect(attempt).rejects.toThrow(USAGE);
+});
+
+describe('npm run users -- stats', () => {
+  /** A day as YYYY-MM-DD, counted back from today by the database's clock, and the Monday of its week. */
+  async function daysAgo(days: number): Promise<{ day: string; week: string }> {
+    const { rows } = await db.query(
+      `SELECT to_char(current_date - $1::int, 'YYYY-MM-DD') AS day,
+              to_char(date_trunc('week', current_date - $1::int), 'YYYY-MM-DD') AS week`,
+      [days],
+    );
+    return rows[0];
+  }
+
+  it("shows each user's weeks: reminder days sent and opened, days with Today, and phrases practiced", async () => {
+    const user = await insertUser(db, 'me@example.com');
+    const { day, week } = await daysAgo(0);
+    await recordActivity(db, user.id, day, 'reminder_sent');
+    await recordActivity(db, user.id, day, 'reminder_opened');
+    await recordActivity(db, user.id, day, 'today_viewed');
+    await recordActivity(db, user.id, day, 'phrase_heard', 1);
+    await recordActivity(db, user.id, day, 'phrase_translated', 1);
+    await recordActivity(db, user.id, day, 'phrase_scored', 2);
+
+    await run(['stats']);
+
+    expect(lines).toEqual([
+      `me@example.com\tweek of ${week}\t1 reminders\t1 opened\t1 days with Today\t2 phrases practiced`,
+    ]);
+  });
+
+  it('leaves out weeks before the ones asked for', async () => {
+    const user = await insertUser(db, 'me@example.com');
+    await recordActivity(db, user.id, (await daysAgo(70)).day, 'reminder_sent');
+    const recent = await daysAgo(0);
+    await recordActivity(db, user.id, recent.day, 'reminder_sent');
+
+    await run(['stats']);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(`week of ${recent.week}`);
+
+    lines = [];
+    await run(['stats', '12']);
+    expect(lines).toHaveLength(2);
+  });
+
+  it('says when there is no activity', async () => {
+    await run(['stats', '1']);
+
+    expect(lines).toEqual(['No activity in the last week.']);
+  });
+
+  it.each(['0', '53', 'two', '1.5'])('refuses %s weeks', async (weeks) => {
+    await expect(run(['stats', weeks])).rejects.toThrow('Give the weeks as a whole number from 1 to 52');
+  });
 });

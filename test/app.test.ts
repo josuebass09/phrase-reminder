@@ -13,6 +13,7 @@ import {
   type User,
 } from '../src/db.js';
 import { hashPassword } from '../src/passwords.js';
+import { localClock } from '../src/schedule.js';
 import { MAX_RECORDING_BYTES, NoSpeechError, type Pronouncer, type Pronunciation } from '../src/pronounce.js';
 import { clearTables, createTestDb, insertAged, insertUser, openSession } from './helpers.js';
 
@@ -812,6 +813,8 @@ describe('POST /api/phrases/:id/pronunciation', () => {
     expect(new TextDecoder().decode(recording.bytes)).toBe('fake audio');
     expect(await lastScore(bob)).toBe(8);
     expect(await usage(target, bob)).toEqual({ used: 1, limit: 20 });
+    const { rows } = await db.query('SELECT kind, phrase_id AS "phraseId" FROM activity WHERE user_id = $1', [bob.id]);
+    expect(rows).toEqual([{ kind: 'phrase_scored', phraseId: phrase.id }]);
   });
 
   it('keeps the score when the text stays the same, and drops it when the text changes', async () => {
@@ -919,6 +922,73 @@ describe('POST /api/phrases/:id/pronunciation', () => {
     expect(second.status).toBe(429);
     expect(await second.json()).toEqual({ error: "You've used today's 1 pronunciation scores. More tomorrow." });
     expect(await usage(target, alice)).toEqual({ used: 2, limit: null });
+  });
+});
+
+describe('POST /api/activity', () => {
+  const report = (user: User | null, body: unknown) =>
+    requestAs(user, '/api/activity', { method: 'POST', body: typeof body === 'string' ? body : JSON.stringify(body) });
+
+  const activity = async (user: User) =>
+    (
+      await db.query('SELECT day, kind, phrase_id AS "phraseId" FROM activity WHERE user_id = $1 ORDER BY kind, phrase_id', [
+        user.id,
+      ])
+    ).rows;
+
+  it("records each kind once on the user's local day, and each phrase kind once per phrase", async () => {
+    await requestAs(bob, '/api/settings', { method: 'PATCH', body: JSON.stringify({ timeZone: 'Pacific/Kiritimati' }) });
+    const first = await addPhrase(db, bob.id, 'one');
+    const second = await addPhrase(db, bob.id, 'two');
+
+    const statuses = [];
+    for (const body of [
+      { kind: 'today_viewed' },
+      { kind: 'today_viewed' },
+      { kind: 'reminder_opened' },
+      { kind: 'phrase_heard', phraseId: first.id },
+      { kind: 'phrase_heard', phraseId: first.id },
+      { kind: 'phrase_heard', phraseId: second.id },
+      { kind: 'phrase_translated', phraseId: first.id },
+    ]) {
+      statuses.push((await report(bob, body)).status);
+    }
+
+    expect(statuses).toEqual([204, 204, 204, 204, 204, 204, 204]);
+    const day = localClock(new Date(), 'Pacific/Kiritimati').day;
+    expect(await activity(bob)).toEqual([
+      { day, kind: 'phrase_heard', phraseId: first.id },
+      { day, kind: 'phrase_heard', phraseId: second.id },
+      { day, kind: 'phrase_translated', phraseId: first.id },
+      { day, kind: 'reminder_opened', phraseId: null },
+      { day, kind: 'today_viewed', phraseId: null },
+    ]);
+  });
+
+  it.each([
+    ['an unknown kind', { kind: 'reminder_sent' }, 400],
+    ['no kind', {}, 400],
+    ['invalid JSON', 'not json', 400],
+    ['a phrase with a kind that has none', { kind: 'today_viewed', phraseId: 1 }, 400],
+    ['a phrase kind without a phrase', { kind: 'phrase_heard' }, 404],
+    ['a phrase id that is a string', { kind: 'phrase_heard', phraseId: '1' }, 404],
+    ['a missing phrase', { kind: 'phrase_heard', phraseId: 999 }, 404],
+  ])('refuses %s and records nothing', async (_name, body, status) => {
+    await addPhrase(db, bob.id, 'one');
+
+    expect((await report(bob, body)).status).toBe(status);
+    expect(await activity(bob)).toEqual([]);
+  });
+
+  it("refuses another user's phrase", async () => {
+    const theirs = await addPhrase(db, alice.id, 'theirs');
+
+    expect((await report(bob, { kind: 'phrase_heard', phraseId: theirs.id })).status).toBe(404);
+    expect(await activity(bob)).toEqual([]);
+  });
+
+  it('requires a token', async () => {
+    expect((await report(null, { kind: 'today_viewed' })).status).toBe(401);
   });
 });
 

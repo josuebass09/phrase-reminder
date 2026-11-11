@@ -31,6 +31,7 @@ import {
   isValidEmail,
   listRecent,
   listToday,
+  recordActivity,
   MAX_PHRASE_LENGTH,
   MAX_TRANSLATION_LENGTH,
   normalizeEmail,
@@ -42,6 +43,7 @@ import {
   saveTranslation,
   updateSettings,
   updatePhrase,
+  type ActivityKind,
   type DailyCounter,
   type Db,
   type DeviceSubscription,
@@ -89,6 +91,10 @@ export const DEFAULT_PRONUNCIATIONS_PER_DAY = 20;
 const NO_LIMIT = 2_147_483_647;
 
 type AppEnv = { Variables: { user: User } };
+
+// What the app reports about a user's day: things done with a phrase, and things done once a day.
+const PHRASE_ACTIVITY = new Set<ActivityKind>(['phrase_heard', 'phrase_translated']);
+const DAY_ACTIVITY = new Set<ActivityKind>(['reminder_opened', 'today_viewed']);
 
 /** The refresh token from a JSON body, or an empty string. */
 function refreshTokenOf(body: any): string {
@@ -495,9 +501,28 @@ export function createApp({
         return c.json({ error: m.pronunciationFailed }, 502);
       }
       await saveScore(db, user.id, id, phrase.text, result.score);
+      await recordActivity(db, user.id, day, 'phrase_scored', id);
       return c.json(result);
     },
   );
+
+  // The app reports what the user did, to tell whether the reminders help. Each kind
+  // counts once a day, or once a day per phrase, however often it's sent.
+  app.post('/api/activity', requireUser, async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const kind = body?.kind;
+    const user = c.get('user');
+    if (DAY_ACTIVITY.has(kind)) {
+      if (body.phraseId !== undefined) return c.json({ error: 'This kind of activity has no phrase' }, 400);
+      await recordActivity(db, user.id, await userDay(user.id), kind);
+      return c.body(null, 204);
+    }
+    if (!PHRASE_ACTIVITY.has(kind)) return c.json({ error: 'Unknown kind of activity' }, 400);
+    const id = typeof body.phraseId === 'number' ? parsePhraseId(String(body.phraseId)) : null;
+    if (id === null || !(await findPhraseTranslation(db, user.id, id))) return c.json({ error: say(c).phraseNotFound }, 404);
+    await recordActivity(db, user.id, await userDay(user.id), kind, id);
+    return c.body(null, 204);
+  });
 
   app.post('/api/push/subscribe', requireUser, async (c) => {
     const subscription = parseSubscription(await c.req.json().catch(() => null));

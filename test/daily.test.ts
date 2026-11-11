@@ -92,6 +92,21 @@ describe('sendDueReminders', () => {
     expect(await shownTexts()).toEqual([]);
   });
 
+  it('records the day a reminder reached a device, and not one that reached none', async () => {
+    await insertAged(db, alice.id, "alice's phrase", 20);
+    await insertAged(db, bob.id, "bob's phrase", 20);
+    await saveSubscription(db, alice.id, phone);
+    await saveSubscription(db, bob.id, laptop);
+    const send = vi.fn(async (subscription: { endpoint: string }) => {
+      if (subscription.endpoint === laptop.endpoint) throw pushError(500);
+    });
+
+    await sendDueReminders(db, send, NOON);
+
+    const { rows } = await db.query('SELECT user_id AS "userId", day, kind FROM activity');
+    expect(rows).toEqual([{ userId: alice.id, day: '2026-11-10', kind: 'reminder_sent' }]);
+  });
+
   it('keeps phrases unshown and reports the error when every device fails', async () => {
     await insertAged(db, alice.id, 'old one', 20);
     await saveSubscription(db, alice.id, phone);
