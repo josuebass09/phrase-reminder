@@ -194,6 +194,30 @@ export async function ensureSchema(db: Db): Promise<void> {
   await db.query(
     'CREATE UNIQUE INDEX IF NOT EXISTS activity_daily_phrase ON activity (user_id, day, kind, phrase_id) WHERE phrase_id IS NOT NULL',
   );
+
+  // Each UTC day's requests to each AI service, for the whole account: the free plans' daily
+  // limits are shared by every user, so these show how close the app runs to them.
+  // units: tokens for Groq's chat, seconds of audio for its speech model, characters for MyMemory.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS ai_usage (
+      day          DATE NOT NULL,
+      service      TEXT NOT NULL,
+      calls        INTEGER NOT NULL DEFAULT 0,
+      failures     INTEGER NOT NULL DEFAULT 0,
+      rate_limited INTEGER NOT NULL DEFAULT 0,
+      units        INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, service)
+    )
+  `);
+  // What Groq last said about each model's daily requests, from its rate-limit headers.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS ai_quota (
+      service        TEXT PRIMARY KEY,
+      requests_limit INTEGER NOT NULL,
+      requests_left  INTEGER NOT NULL,
+      checked_at     TIMESTAMPTZ NOT NULL
+    )
+  `);
 }
 
 /** Emails are compared trimmed and lowercased, so "Me@Example.com " finds me@example.com. */
@@ -711,4 +735,80 @@ export async function importPhrases(db: Db, userId: number, texts: string[]): Pr
     added += rows.length;
   }
   return added;
+}
+
+/** The AI services the backend calls: Groq's chat and speech models, and MyMemory's translations. */
+export type AiService = 'groq_chat' | 'groq_speech' | 'mymemory';
+
+export const AI_SERVICES: AiService[] = ['groq_chat', 'groq_speech', 'mymemory'];
+
+/** One request to an AI service, and what it used. */
+export interface AiUse {
+  service: AiService;
+  ok: boolean;
+  /** Refused for a rate limit or a used-up daily quota. */
+  rateLimited: boolean;
+  /** Tokens for a chat answer, seconds of audio heard, or characters translated. */
+  units: number;
+  /** Groq's daily requests for the model, and how many are left, when it said. */
+  quota?: { limit: number; left: number };
+}
+
+/** Counts one request on its UTC day, and keeps what Groq said is left of its daily quota. */
+export async function recordAiUse(db: Db, use: AiUse, now = new Date()): Promise<void> {
+  await db.query(
+    `INSERT INTO ai_usage (day, service, calls, failures, rate_limited, units)
+     VALUES ($1::date, $2, 1, $3, $4, $5)
+     ON CONFLICT (day, service) DO UPDATE SET
+       calls = ai_usage.calls + 1,
+       failures = ai_usage.failures + EXCLUDED.failures,
+       rate_limited = ai_usage.rate_limited + EXCLUDED.rate_limited,
+       units = ai_usage.units + EXCLUDED.units`,
+    [now.toISOString().slice(0, 10), use.service, use.ok ? 0 : 1, use.rateLimited ? 1 : 0, Math.max(0, Math.round(use.units))],
+  );
+  if (use.quota) {
+    await db.query(
+      `INSERT INTO ai_quota (service, requests_limit, requests_left, checked_at) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (service) DO UPDATE SET
+         requests_limit = EXCLUDED.requests_limit, requests_left = EXCLUDED.requests_left, checked_at = EXCLUDED.checked_at`,
+      [use.service, use.quota.limit, use.quota.left, now],
+    );
+  }
+}
+
+/** One service's requests on one UTC day. */
+export interface AiDay {
+  day: string;
+  service: AiService;
+  calls: number;
+  failures: number;
+  rateLimited: number;
+  units: number;
+}
+
+/** Every service's requests on each of the last `days` UTC days, today included, oldest first. Days with none are left out. */
+export async function aiUsageSince(db: Db, days: number, now = new Date()): Promise<AiDay[]> {
+  const { rows } = await db.query(
+    `SELECT to_char(day, 'YYYY-MM-DD') AS day, service, calls, failures, rate_limited AS "rateLimited", units
+     FROM ai_usage
+     WHERE day > $1::date - $2::int
+     ORDER BY day, service`,
+    [now.toISOString().slice(0, 10), days],
+  );
+  return rows;
+}
+
+/** What Groq last said is left of each model's daily requests. */
+export interface AiQuota {
+  service: AiService;
+  limit: number;
+  left: number;
+  checkedAt: Date;
+}
+
+export async function aiQuotas(db: Db): Promise<AiQuota[]> {
+  const { rows } = await db.query(
+    'SELECT service, requests_limit AS "limit", requests_left AS "left", checked_at AS "checkedAt" FROM ai_quota ORDER BY service',
+  );
+  return rows;
 }

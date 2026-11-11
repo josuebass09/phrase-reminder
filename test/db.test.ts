@@ -1,6 +1,9 @@
 import { PGlite } from '@electric-sql/pglite';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
+  aiQuotas,
+  aiUsageSince,
+  recordAiUse,
   addPhrase,
   claimInvite,
   claimUnowned,
@@ -440,6 +443,43 @@ describe('importPhrases', () => {
 
     expect(added).toBe(1);
     expect(await listRecent(db, alice.id)).toHaveLength(2);
+  });
+});
+
+describe('AI usage', () => {
+  const day = (iso: string) => new Date(`${iso}T12:00:00Z`);
+
+  it("adds up each service's requests on their UTC day", async () => {
+    await recordAiUse(db, { service: 'groq_chat', ok: true, rateLimited: false, units: 300 }, day('2026-11-10'));
+    await recordAiUse(db, { service: 'groq_chat', ok: false, rateLimited: true, units: 0 }, day('2026-11-11'));
+    await recordAiUse(db, { service: 'groq_chat', ok: true, rateLimited: false, units: 250 }, day('2026-11-11'));
+    await recordAiUse(db, { service: 'mymemory', ok: true, rateLimited: false, units: 42 }, day('2026-11-11'));
+
+    expect(await aiUsageSince(db, 30, day('2026-11-11'))).toEqual([
+      { day: '2026-11-10', service: 'groq_chat', calls: 1, failures: 0, rateLimited: 0, units: 300 },
+      { day: '2026-11-11', service: 'groq_chat', calls: 2, failures: 1, rateLimited: 1, units: 250 },
+      { day: '2026-11-11', service: 'mymemory', calls: 1, failures: 0, rateLimited: 0, units: 42 },
+    ]);
+  });
+
+  it('gives only the last days asked for, today included', async () => {
+    await recordAiUse(db, { service: 'groq_speech', ok: true, rateLimited: false, units: 3 }, day('2026-11-01'));
+    await recordAiUse(db, { service: 'groq_speech', ok: true, rateLimited: false, units: 4 }, day('2026-11-02'));
+
+    const days = await aiUsageSince(db, 10, day('2026-11-11'));
+
+    expect(days.map((row) => row.day)).toEqual(['2026-11-02']);
+  });
+
+  it("keeps the latest of what Groq said is left of each model's daily requests", async () => {
+    const chat = { service: 'groq_chat', ok: true, rateLimited: false, units: 1 } as const;
+    await recordAiUse(db, { ...chat, quota: { limit: 1000, left: 900 } }, new Date('2026-11-11T10:00:00Z'));
+    await recordAiUse(db, { ...chat, quota: { limit: 1000, left: 899 } }, new Date('2026-11-11T10:05:00Z'));
+    await recordAiUse(db, chat); // Without headers, the last one stays.
+
+    expect(await aiQuotas(db)).toEqual([
+      { service: 'groq_chat', limit: 1000, left: 899, checkedAt: new Date('2026-11-11T10:05:00Z') },
+    ]);
   });
 });
 

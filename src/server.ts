@@ -5,8 +5,9 @@ import {
   DEFAULT_SUGGESTIONS_PER_DAY,
   DEFAULT_TRANSLATIONS_PER_DAY,
 } from './app.js';
-import { connect, ensureSchema } from './db.js';
+import { connect, ensureSchema, recordAiUse } from './db.js';
 import { requireEnv } from './env.js';
+import { meteredFetch } from './meter.js';
 import { createGroqPronouncer } from './pronounce.js';
 import { createGroqSuggester } from './suggest.js';
 import { createMyMemoryTranslator } from './translate.js';
@@ -33,6 +34,9 @@ const groqModel = process.env.GROQ_MODEL || undefined;
 const db = connect(requireEnv('DATABASE_URL'));
 await ensureSchema(db);
 
+// Every request to Groq and MyMemory is counted, for the admin to see how close the app runs to their free limits.
+const aiFetch = meteredFetch((use) => recordAiUse(db, use));
+
 const app = createApp({
   db,
   tokenSecret,
@@ -43,15 +47,16 @@ const app = createApp({
     .map((origin) => origin.trim().replace(/\/+$/, ''))
     .filter(Boolean),
   // Optional. Raises MyMemory's free daily limit from about 5,000 to 50,000 characters.
-  translate: createMyMemoryTranslator({ email: process.env.MYMEMORY_EMAIL || undefined }),
+  translate: createMyMemoryTranslator({ email: process.env.MYMEMORY_EMAIL || undefined, fetch: aiFetch }),
   translationsPerDay: dailyLimit('TRANSLATIONS_PER_DAY', DEFAULT_TRANSLATIONS_PER_DAY),
-  suggest: groqKey ? createGroqSuggester({ apiKey: groqKey, model: groqModel }) : undefined,
+  suggest: groqKey ? createGroqSuggester({ apiKey: groqKey, model: groqModel, fetch: aiFetch }) : undefined,
   suggestionsPerDay: dailyLimit('SUGGESTIONS_PER_DAY', DEFAULT_SUGGESTIONS_PER_DAY),
   pronounce: groqKey
     ? createGroqPronouncer({
         apiKey: groqKey,
         model: groqModel,
         transcriptionModel: process.env.GROQ_TRANSCRIPTION_MODEL || undefined,
+        fetch: aiFetch,
       })
     : undefined,
   pronunciationsPerDay: dailyLimit('PRONUNCIATIONS_PER_DAY', DEFAULT_PRONUNCIATIONS_PER_DAY),
