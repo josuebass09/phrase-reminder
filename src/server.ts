@@ -10,6 +10,7 @@ import {
 import { connect, ensureSchema, recordAiUse } from './db.js';
 import { requireEnv } from './env.js';
 import { meteredFetch } from './meter.js';
+import { createGroqExplainer } from './explain.js';
 import { createGroqPronouncer } from './pronounce.js';
 import { createGroqSuggester } from './suggest.js';
 import { createMyMemoryTranslator } from './translate.js';
@@ -30,7 +31,7 @@ function dailyLimit(name: string, fallback: number): number {
 
 // Optional. Without a key, asking for suggestions or pronunciation scores answers that they aren't available.
 const groqKey = process.env.GROQ_API_KEY;
-if (!groqKey) console.warn('GROQ_API_KEY is not set, so suggestions and pronunciation scores are off');
+if (!groqKey) console.warn('GROQ_API_KEY is not set, so suggestions, explanations and pronunciation scores are off');
 const groqModel = process.env.GROQ_MODEL || undefined;
 
 const db = connect(requireEnv('DATABASE_URL'));
@@ -53,6 +54,8 @@ const app = createApp({
   translationsPerDay: dailyLimit('TRANSLATIONS_PER_DAY', DEFAULT_TRANSLATIONS_PER_DAY),
   suggest: groqKey ? createGroqSuggester({ apiKey: groqKey, model: groqModel, fetch: aiFetch }) : undefined,
   suggestionsPerDay: dailyLimit('SUGGESTIONS_PER_DAY', DEFAULT_SUGGESTIONS_PER_DAY),
+  // Shares the suggestions' daily limit.
+  explain: groqKey ? createGroqExplainer({ apiKey: groqKey, model: groqModel, fetch: aiFetch }) : undefined,
   pronounce: groqKey
     ? createGroqPronouncer({
         apiKey: groqKey,

@@ -28,10 +28,12 @@ Stack: TypeScript on Node, Hono, Railway Postgres, a Railway cron service, and W
 
 **Out:** everything below.
 
+## Added Later
+- **Meanings and examples from the AI:** first left out for its cost and the dependency. Groq came in later for suggestions and pronunciation tips, on a free plan, so the dependency was already there. **Understand a word** takes an English word heard somewhere and a context, and gives its meaning in Spanish and two example sentences. A saved sentence brings the word back in context, which fits the goal of remembering without memorizing. It shares the suggestions' daily limit, so the cost stays the same.
+
 ## Not Doing (and Why)
 - **Quizzes:** the goal is simplicity. Reconsider only if the first assumption fails.
 - **Telegram bot:** the input page already covers saving.
-- **LLM meanings and examples:** adds cost and a dependency.
 - **Open sign-up:** signing up needs an invite link from the admin, so strangers can't make accounts.
 - **Native mobile app:** a web page with web push works on both devices.
 - **Email reminders:** replaced by push notifications.

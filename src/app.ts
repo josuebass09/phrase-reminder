@@ -61,6 +61,7 @@ import {
   type ReminderSettings,
   type User,
 } from './db.js';
+import type { Explainer } from './explain.js';
 import { hashInviteCode, INVITE_LIFETIME_DAYS, newInviteCode } from './invites.js';
 import { isLanguage, languageFrom, messagesFor, type Messages } from './messages.js';
 import { checkNewPassword, dummyHash, hashPassword, MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH, verifyPassword } from './passwords.js';
@@ -84,6 +85,11 @@ export interface AppConfig {
   suggest?: Suggester;
   /** Suggestions each user may ask for per local day. The admin has no limit. */
   suggestionsPerDay?: number;
+  /**
+   * Explains an English word or phrase with two examples. Without it, explanations get a 503.
+   * Each one counts toward the same daily limit as suggestions.
+   */
+  explain?: Explainer;
   /** Scores how the user says a phrase aloud. Without it, asking for a score gets a 503. */
   pronounce?: Pronouncer;
   /** Pronunciation scores each user may ask for per local day. The admin has no limit. */
@@ -224,6 +230,7 @@ export function createApp({
   translationsPerDay = DEFAULT_TRANSLATIONS_PER_DAY,
   suggest,
   suggestionsPerDay = DEFAULT_SUGGESTIONS_PER_DAY,
+  explain,
   pronounce,
   pronunciationsPerDay = DEFAULT_PRONUNCIATIONS_PER_DAY,
   mymemoryCharsPerDay = MYMEMORY_FREE_CHARS_PER_DAY,
@@ -625,6 +632,32 @@ export function createApp({
     } catch (error) {
       await releaseDailyUse(db, user.id, 'suggestions', day);
       console.error('Suggestions failed:', error);
+      return c.json({ error: m.suggestionsFailed }, 502);
+    }
+  });
+
+  // What an English word or phrase the user heard means, with two example sentences
+  // and their Spanish. Nothing is saved until the user picks an example. It shares the
+  // suggestions' daily limit, which keeps the chat model inside its free plan.
+  app.post('/api/explanations', requireUser, async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const text = phraseTextOf(body);
+    const m = say(c);
+    if (!text) return c.json({ error: m.invalidText }, 400);
+    // Optional: where the user would like to see it used.
+    const context = body.context ?? '';
+    if (typeof context !== 'string' || context.length > MAX_CONTEXT_LENGTH) return c.json({ error: m.invalidContext }, 400);
+    if (!explain) return c.json({ error: m.explanationsUnavailable }, 503);
+
+    const user = c.get('user');
+    const day = await reserve(user, 'suggestions');
+    if (!day) return c.json({ error: m.suggestionLimit(suggestionsPerDay) }, 429);
+
+    try {
+      return c.json(await explain(text, context.trim() || undefined));
+    } catch (error) {
+      await releaseDailyUse(db, user.id, 'suggestions', day);
+      console.error('Explanation failed:', error);
       return c.json({ error: m.suggestionsFailed }, 502);
     }
   });

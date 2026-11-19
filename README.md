@@ -103,6 +103,7 @@ The app lives in its own repository and domain. Two `*.up.railway.app` domains c
 | `GET /api/phrases/:id/translation` | Yes | `{ translation }` in Spanish, or 404. 429 once the user's new translations for the day are used up, and 502 if the translation service fails |
 | `POST /api/suggestions` with `{ text }`, and optionally `context` | Yes | `{ formal, informal }`, each `{ text }`: two ways to say the text in English. `context` (up to 300 characters) says who it's for, where, or what it's about, so the options fit. Saves nothing. 429 once the user's suggestions for the day are used up, 502 if the AI fails, 503 without `GROQ_API_KEY` |
 | `POST /api/phrases/:id/pronunciation` with a recording as the body, and its type, such as `audio/webm`, as `Content-Type` | Yes | `{ score, words, heard, tip }`: the score from 1 to 10, the phrase's words as `{ text, ok }`, what was heard, and a tip in the user's language. The score is saved as the phrase's `lastScore`. 400 for a body that isn't audio Groq reads, 413 over 1 MB, 422 if nobody spoke, 429 once the user's scores for the day are used up, 502 if Groq fails, 503 without `GROQ_API_KEY` |
+| `POST /api/explanations` with `{ text }`, and optionally `context` | Yes | `{ meaning, examples }`: what an English word or phrase means, in Spanish, and two `{ text, translation }` sentences that use it. `context` (up to 300 characters) says where the user would like to see it used. Saves nothing. Counts toward the suggestions' daily limit, with the same 429, 502 and 503 |
 | `GET /api/usage` | Yes | `{ translations, suggestions, pronunciations }`, each `{ used, limit }`: what the user has used today, and the daily limit (`null` for the admin) |
 | `POST /api/activity` with `{ kind }`, and `phraseId` for a phrase kind | Yes | 204, once recorded (see Activity). 400 for an unknown kind, or a phrase with a kind that has none, and 404 for a phrase that isn't the user's |
 | `POST /api/phrases/:id/review` with `{ as }`, `read` or `remembered` | Yes | `{ box, days }`: takes the phrase off Today, schedules when it comes back (see Spaced repetition), and records the answer (see Activity). Answering again the same day replaces it. 400 for another `as`, 404 for a phrase that isn't the user's |
@@ -132,6 +133,12 @@ The app speaks English or Spanish, and each user's choice is saved as `language`
 The app's Translate button takes a new phrase the user wants to say, in Spanish or English, and shows a formal and an informal way to say it, in English only. An optional context, such as "Slack message to my manager about a late deploy", helps the AI fit the words and tone to the situation. Saving one adds it as a phrase, which translates to Spanish like any other.
 
 The backend asks `openai/gpt-oss-120b` on [Groq](https://console.groq.com/), whose free plan needs no card. Create a key under API Keys and set it as `GROQ_API_KEY` on the web service; `GROQ_MODEL` picks another model. The free plan allows about 1,000 requests a day and 30 a minute for the whole account (see [rate limits](https://console.groq.com/docs/rate-limits)), so each user may ask for 20 suggestions a day, counted like translations: on their local day, a failed answer is given back, and the admin has no limit. Set `SUGGESTIONS_PER_DAY` to change the 20. With 20 users, that's at most 400 requests a day. What users type is sent to Groq.
+
+## Explanations
+
+The app's **Understand a word** mode takes an English word or phrase the user heard and didn't understand, and an optional context, such as "code review at work". The same Groq model answers with what it means, in Spanish, and two sentences that use it in that context, each with its Spanish. Saving a sentence adds it as a phrase with that translation, so showing it in Spanish later is free.
+
+Each explanation is one chat request, and it counts toward the user's suggestions for the day rather than a limit of its own, so the account stays under the free plan's 1,000 requests a day.
 
 ## Pronunciation
 

@@ -16,6 +16,7 @@ import {
   type Db,
   type User,
 } from '../src/db.js';
+import type { Explainer, Explanation } from '../src/explain.js';
 import { hashPassword } from '../src/passwords.js';
 import { localClock } from '../src/schedule.js';
 import { MAX_RECORDING_BYTES, NoAudioError, NoSpeechError, type Pronouncer, type Pronunciation } from '../src/pronounce.js';
@@ -896,6 +897,134 @@ describe('POST /api/suggestions', () => {
     const target = appWith(async () => OPTIONS, 1);
 
     for (const text of ['uno', 'dos']) expect((await ask(target, alice, { text })).status).toBe(200);
+
+    expect(await usage(target, alice)).toEqual({ used: 2, limit: null });
+  });
+});
+
+describe('POST /api/explanations', () => {
+  const EXPLANATION: Explanation = {
+    meaning: 'Criticar detalles pequeños y sin importancia.',
+    examples: [
+      { text: "Let's not nitpick the variable names.", translation: 'No seamos quisquillosos con los nombres de las variables.' },
+      { text: 'He always nitpicks my pull requests.', translation: 'Siempre critica detalles mínimos de mis pull requests.' },
+    ],
+  };
+
+  function appWith(explain?: Explainer, suggestionsPerDay?: number) {
+    return createApp({
+      db,
+      tokenSecret: SECRET,
+      vapidPublicKey: 'k',
+      explain,
+      suggest: async () => ({ formal: { text: 'a' }, informal: { text: 'b' } }),
+      suggestionsPerDay,
+    });
+  }
+
+  async function ask(target: ReturnType<typeof createApp>, user: User | null, body: unknown, path = '/api/explanations') {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (user) headers.Authorization = await bearer(user);
+    const payload = typeof body === 'string' ? body : JSON.stringify(body);
+    return target.request(path, { method: 'POST', headers, body: payload });
+  }
+
+  const usage = async (target: ReturnType<typeof createApp>, user: User) =>
+    (await (await target.request('/api/usage', { headers: { Authorization: await bearer(user) } })).json()).suggestions;
+
+  it('gives the meaning and two examples for the trimmed term, and saves no phrase', async () => {
+    const explain = vi.fn(async () => EXPLANATION);
+
+    const response = await ask(appWith(explain), bob, { text: '  nitpick  ' });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(EXPLANATION);
+    expect(explain).toHaveBeenCalledWith('nitpick', undefined);
+    expect(await listRecent(db, bob.id)).toEqual([]);
+  });
+
+  it('passes the trimmed context to the AI, and none when it is blank', async () => {
+    const explain = vi.fn(async () => EXPLANATION);
+    const target = appWith(explain);
+
+    await ask(target, bob, { text: 'nitpick', context: '  code review at work  ' });
+    await ask(target, bob, { text: 'nitpick', context: '   ' });
+
+    expect(explain.mock.calls).toEqual([
+      ['nitpick', 'code review at work'],
+      ['nitpick', undefined],
+    ]);
+  });
+
+  it.each([
+    ['a non-string context', { text: 'nitpick', context: 42 }],
+    ['a context over the limit', { text: 'nitpick', context: 'x'.repeat(301) }],
+  ])('rejects %s without asking the AI', async (_name, body) => {
+    const explain = vi.fn(async () => EXPLANATION);
+
+    const response = await ask(appWith(explain), bob, body);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: 'Context must be text of up to 300 characters' });
+    expect(explain).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['blank text', { text: '  ' }],
+    ['text over the limit', { text: 'x'.repeat(MAX_PHRASE_LENGTH + 1) }],
+    ['invalid JSON', 'not json'],
+  ])('rejects %s without asking the AI or counting it', async (_name, body) => {
+    const explain = vi.fn(async () => EXPLANATION);
+    const target = appWith(explain);
+
+    expect((await ask(target, bob, body)).status).toBe(400);
+    expect(explain).not.toHaveBeenCalled();
+    expect(await usage(target, bob)).toEqual({ used: 0, limit: 20 });
+  });
+
+  it('requires a token', async () => {
+    expect((await ask(appWith(async () => EXPLANATION), null, { text: 'nitpick' })).status).toBe(401);
+  });
+
+  it('answers 503 when no AI is set up', async () => {
+    const response = await ask(appWith(), bob, { text: 'nitpick' });
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "Explanations aren't available right now" });
+  });
+
+  it('answers 502 and does not count it when the AI fails', async () => {
+    const target = appWith(vi.fn().mockRejectedValue(new Error('Groq answered HTTP 500')));
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const response = await ask(target, bob, { text: 'nitpick' });
+    quiet.mockRestore();
+
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({ error: "Couldn't get an answer right now. Try again." });
+    expect(await usage(target, bob)).toEqual({ used: 0, limit: 20 });
+  });
+
+  it('shares the daily limit with suggestions, then answers 429', async () => {
+    const target = appWith(async () => EXPLANATION, 2);
+
+    const statuses = [
+      (await ask(target, bob, { text: 'nitpick' })).status,
+      (await ask(target, bob, { text: 'Hola' }, '/api/suggestions')).status,
+    ];
+    const third = await ask(target, bob, { text: 'nitpick' });
+
+    expect(statuses).toEqual([200, 200]);
+    expect(third.status).toBe(429);
+    expect(await third.json()).toEqual({ error: "You've used today's 2 suggestions. More tomorrow." });
+    expect(await usage(target, bob)).toEqual({ used: 2, limit: 2 });
+    expect((await ask(target, alice, { text: 'nitpick' })).status).toBe(200);
+  });
+
+  it('does not limit the admin, but still counts', async () => {
+    const target = appWith(async () => EXPLANATION, 1);
+
+    for (const text of ['nitpick', 'gaslight']) expect((await ask(target, alice, { text })).status).toBe(200);
 
     expect(await usage(target, alice)).toEqual({ used: 2, limit: null });
   });
